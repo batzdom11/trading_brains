@@ -1,0 +1,9 @@
+flask==3.0.0
+numpy>=1.26.0,<2.0
+pandas==2.1.0
+yfinance==0.2.31
+torch==2.1.0
+pytorch-forecasting==1.6.1
+pytorch-lightning==2.1.0
+google-cloud-storage==2.13.0
+google-cloud-bigquery==3.13.0
