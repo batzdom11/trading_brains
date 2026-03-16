@@ -479,22 +479,46 @@ def test_model():
     import pandas as pd
     import torch
     import yfinance as yf
-    from datetime import datetime, timedelta
+    from datetime import datetime
     from pytorch_forecasting import TimeSeriesDataSet
+    import time
     
     try:
         # Get model (lazy load)
         model, dataset_params, device = get_model()
         
-        # Download historical data (last 5 trading days) - always available
-        end_date = datetime.now() - timedelta(days=1)  # Yesterday
-        start_date = end_date - timedelta(days=7)  # Week before
+        # Download historical data with retries (same approach as get_predictions)
+        max_retries = 3
+        df = None
+        last_error = None
         
-        print(f"Downloading historical SPY data from {start_date.date()} to {end_date.date()}...")
-        df = yf.download('SPY', start=start_date, end=end_date, interval='1m', progress=False)
+        for attempt in range(max_retries):
+            try:
+                periods = ['5d', '7d', '10d']
+                period = periods[attempt % len(periods)]
+                
+                print(f"Test attempt {attempt + 1}: Downloading SPY data (period={period})...")
+                df = yf.download('SPY', period=period, interval='1m', progress=False)
+                
+                if not df.empty:
+                    print(f"Successfully downloaded {len(df)} rows")
+                    break
+                else:
+                    print(f"Empty dataframe on attempt {attempt + 1}")
+                    
+            except Exception as e:
+                last_error = e
+                print(f"Attempt {attempt + 1} failed: {e}")
+            
+            if attempt < max_retries - 1:
+                time.sleep(2)
         
-        if df.empty:
-            return jsonify({'error': 'Could not download historical data', 'status': 'failed'}), 500
+        if df is None or df.empty:
+            return jsonify({
+                'error': f'Could not download historical data after {max_retries} attempts',
+                'last_error': str(last_error),
+                'status': 'failed'
+            }), 500
         
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
