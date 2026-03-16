@@ -263,14 +263,40 @@ def get_predictions():
     import yfinance as yf
     from datetime import datetime
     from pytorch_forecasting import TimeSeriesDataSet
+    import time
     
     # Get model (lazy load)
     model, dataset_params, device = get_model()
     
-    # 1. Download real-time data
-    df = yf.download('SPY', period='5d', interval='1m', progress=False)
-    if df.empty:
-        raise ValueError("No market data available - market may be closed")
+    # 1. Download real-time data with retries
+    max_retries = 3
+    df = None
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            periods = ['5d', '7d', '10d']
+            period = periods[attempt % len(periods)]
+            
+            print(f"Attempt {attempt + 1}: Downloading SPY data (period={period})...")
+            df = yf.download('SPY', period=period, interval='1m', progress=False)
+            
+            if not df.empty:
+                print(f"Successfully downloaded {len(df)} rows")
+                break
+            else:
+                print(f"Empty dataframe on attempt {attempt + 1}")
+                
+        except Exception as e:
+            last_error = e
+            print(f"Attempt {attempt + 1} failed: {e}")
+        
+        if attempt < max_retries - 1:
+            time.sleep(2)
+    
+    if df is None or df.empty:
+        raise ValueError(f"No market data available after {max_retries} attempts. Last error: {last_error}")
+    
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(1)
     df = df.reset_index()
@@ -445,6 +471,103 @@ def record_actuals():
         print(f"Error: {str(e)}")
         print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
+    
+@app.route('/test', methods=['GET', 'POST'])
+def test_model():
+    """Test endpoint - uses historical data to verify model functionality"""
+    import numpy as np
+    import pandas as pd
+    import torch
+    import yfinance as yf
+    from datetime import datetime, timedelta
+    from pytorch_forecasting import TimeSeriesDataSet
+    
+    try:
+        # Get model (lazy load)
+        model, dataset_params, device = get_model()
+        
+        # Download historical data (last 5 trading days) - always available
+        end_date = datetime.now() - timedelta(days=1)  # Yesterday
+        start_date = end_date - timedelta(days=7)  # Week before
+        
+        print(f"Downloading historical SPY data from {start_date.date()} to {end_date.date()}...")
+        df = yf.download('SPY', start=start_date, end=end_date, interval='1m', progress=False)
+        
+        if df.empty:
+            return jsonify({'error': 'Could not download historical data', 'status': 'failed'}), 500
+        
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        df = df.reset_index()
+        df.rename(columns={'Datetime': 'timestamp', 'Open': 'open', 'High': 'high', 
+                           'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
+        df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
+        
+        # Feature engineering
+        df_features = calculate_all_features(df)
+        
+        # Prepare for prediction
+        df_pred = df_features.copy()
+        df_pred = df_pred.dropna()
+        df_pred = df_pred.reset_index(drop=True)
+        df_pred['time_idx'] = range(len(df_pred))
+        df_pred['group'] = 'SPY'
+        
+        # Clean data
+        numeric_cols = df_pred.select_dtypes(include=[np.number]).columns.tolist()
+        df_pred[numeric_cols] = df_pred[numeric_cols].replace([np.inf, -np.inf], np.nan)
+        df_pred[numeric_cols] = df_pred[numeric_cols].ffill().bfill()
+        
+        # Take recent data
+        max_encoder_length = dataset_params.get('max_encoder_length', 60)
+        max_prediction_length = dataset_params.get('max_prediction_length', 60)
+        min_rows = max_encoder_length + max_prediction_length + 100
+        df_recent = df_pred.iloc[-min_rows:].copy()
+        df_recent['time_idx'] = range(len(df_recent))
+        
+        # Create dataset and predict
+        prediction_dataset = TimeSeriesDataSet.from_parameters(
+            dataset_params,
+            df_recent,
+            predict=True,
+        )
+        pred_dataloader = prediction_dataset.to_dataloader(train=False, batch_size=1, num_workers=0)
+        
+        with torch.no_grad():
+            for x_batch, y_batch in pred_dataloader:
+                pass
+            x_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in x_batch.items()}
+            output = model(x_batch)
+        
+        raw_pred = output.prediction.squeeze().cpu().numpy()
+        if len(raw_pred.shape) == 2:
+            pred_array = raw_pred[:, raw_pred.shape[1] // 2]
+        else:
+            pred_array = raw_pred
+        
+        last_close = df_recent['close'].iloc[-61]
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Model loaded and inference completed successfully',
+            'test_data': {
+                'rows_downloaded': len(df),
+                'rows_after_features': len(df_pred),
+                'data_range': f"{df['timestamp'].min()} to {df['timestamp'].max()}",
+                'base_price': float(last_close),
+                'pred_15m': float(pred_array[14]),
+                'pred_30m': float(pred_array[29]),
+                'pred_45m': float(pred_array[44]),
+                'pred_60m': float(pred_array[59]),
+            }
+        })
+        
+    except Exception as e:
+        import traceback
+        print(f"Test error: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({'status': 'failed', 'error': str(e)}), 500
+        
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
