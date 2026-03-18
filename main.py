@@ -256,51 +256,71 @@ def calculate_all_features(df):
     return df
 
 def download_market_data(ticker='SPY', days=7):
-    """Download intraday data from Finnhub with retry logic"""
-    import finnhub
+    """Download intraday data from Twelve Data API (free tier supports 1-min US stocks)"""
+    import requests
     import pandas as pd
     from datetime import datetime, timedelta
     import time
     
-    api_key = os.environ.get('FINNHUB_API_KEY')
+    api_key = os.environ.get('TWELVEDATA_API_KEY')
     if not api_key:
-        raise ValueError("FINNHUB_API_KEY environment variable not set")
-    
-    client = finnhub.Client(api_key=api_key)
+        raise ValueError("TWELVEDATA_API_KEY environment variable not set")
     
     max_retries = 3
     last_error = None
     
     for attempt in range(max_retries):
         try:
-            # Get candles for specified days
-            days_to_fetch = days + (attempt * 2)  # Increase range on retry
-            end = int(datetime.now().timestamp())
-            start = int((datetime.now() - timedelta(days=days_to_fetch)).timestamp())
+            # Twelve Data supports outputsize up to 5000 for 1-min data
+            outputsize = min(5000, days * 390)  # ~390 minutes per trading day
             
-            print(f"Attempt {attempt + 1}: Downloading {ticker} data from Finnhub ({days_to_fetch} days)...")
-            candles = client.stock_candles(ticker, '1', start, end)
+            print(f"Attempt {attempt + 1}: Downloading {ticker} data from Twelve Data...")
             
-            if candles['s'] != 'ok' or not candles.get('t'):
-                print(f"Finnhub returned no data on attempt {attempt + 1}")
+            url = "https://api.twelvedata.com/time_series"
+            params = {
+                'symbol': ticker,
+                'interval': '1min',
+                'outputsize': outputsize,
+                'apikey': api_key,
+                'timezone': 'America/New_York'
+            }
+            
+            response = requests.get(url, params=params, timeout=30)
+            data = response.json()
+            
+            if 'code' in data and data['code'] != 200:
+                error_msg = data.get('message', 'Unknown error')
+                print(f"Twelve Data error: {error_msg}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                last_error = Exception(error_msg)
+                continue
+            
+            if 'values' not in data or not data['values']:
+                print(f"No data returned on attempt {attempt + 1}")
                 if attempt < max_retries - 1:
                     time.sleep(2)
                 continue
             
-            df = pd.DataFrame({
-                'timestamp': pd.to_datetime(candles['t'], unit='s'),
-                'open': candles['o'],
-                'high': candles['h'],
-                'low': candles['l'],
-                'close': candles['c'],
-                'volume': candles['v']
+            # Parse the response
+            df = pd.DataFrame(data['values'])
+            df['timestamp'] = pd.to_datetime(df['datetime'])
+            df = df.rename(columns={
+                'open': 'open',
+                'high': 'high', 
+                'low': 'low',
+                'close': 'close',
+                'volume': 'volume'
             })
             
-            # Convert to Eastern Time (market time) for proper timestamp handling
-            df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('America/New_York').dt.tz_localize(None)
+            # Convert to numeric
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
             df = df.sort_values('timestamp').reset_index(drop=True)
             
-            print(f"Successfully downloaded {len(df)} rows from Finnhub")
+            print(f"Successfully downloaded {len(df)} rows from Twelve Data")
             return df
             
         except Exception as e:
