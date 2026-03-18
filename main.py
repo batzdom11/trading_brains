@@ -255,53 +255,77 @@ def calculate_all_features(df):
     
     return df
 
+def download_market_data(ticker='SPY', days=7):
+    """Download intraday data from Finnhub with retry logic"""
+    import finnhub
+    import pandas as pd
+    from datetime import datetime, timedelta
+    import time
+    
+    api_key = os.environ.get('FINNHUB_API_KEY')
+    if not api_key:
+        raise ValueError("FINNHUB_API_KEY environment variable not set")
+    
+    client = finnhub.Client(api_key=api_key)
+    
+    max_retries = 3
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Get candles for specified days
+            days_to_fetch = days + (attempt * 2)  # Increase range on retry
+            end = int(datetime.now().timestamp())
+            start = int((datetime.now() - timedelta(days=days_to_fetch)).timestamp())
+            
+            print(f"Attempt {attempt + 1}: Downloading {ticker} data from Finnhub ({days_to_fetch} days)...")
+            candles = client.stock_candles(ticker, '1', start, end)
+            
+            if candles['s'] != 'ok' or not candles.get('t'):
+                print(f"Finnhub returned no data on attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                continue
+            
+            df = pd.DataFrame({
+                'timestamp': pd.to_datetime(candles['t'], unit='s'),
+                'open': candles['o'],
+                'high': candles['h'],
+                'low': candles['l'],
+                'close': candles['c'],
+                'volume': candles['v']
+            })
+            
+            # Convert to Eastern Time (market time) for proper timestamp handling
+            df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('America/New_York').dt.tz_localize(None)
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            
+            print(f"Successfully downloaded {len(df)} rows from Finnhub")
+            return df
+            
+        except Exception as e:
+            last_error = e
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+    
+    raise ValueError(f"No market data available after {max_retries} attempts. Last error: {last_error}")
+
 def get_predictions():
     """Download data, engineer features, run model, return predictions"""
     import numpy as np
     import pandas as pd
     import torch
-    import yfinance as yf
     from datetime import datetime
     from pytorch_forecasting import TimeSeriesDataSet
-    import time
     
     # Get model (lazy load)
     model, dataset_params, device = get_model()
     
-    # 1. Download real-time data with retries
-    max_retries = 3
-    df = None
-    last_error = None
+    # 1. Download real-time data from Finnhub
+    df = download_market_data('SPY', days=7)
     
-    for attempt in range(max_retries):
-        try:
-            periods = ['5d', '7d', '10d']
-            period = periods[attempt % len(periods)]
-            
-            print(f"Attempt {attempt + 1}: Downloading SPY data (period={period})...")
-            df = yf.download('SPY', period=period, interval='1m', progress=False)
-            
-            if not df.empty:
-                print(f"Successfully downloaded {len(df)} rows")
-                break
-            else:
-                print(f"Empty dataframe on attempt {attempt + 1}")
-                
-        except Exception as e:
-            last_error = e
-            print(f"Attempt {attempt + 1} failed: {e}")
-        
-        if attempt < max_retries - 1:
-            time.sleep(2)
-    
-    if df is None or df.empty:
-        raise ValueError(f"No market data available after {max_retries} attempts. Last error: {last_error}")
-    
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(1)
-    df = df.reset_index()
-    df.rename(columns={'Datetime': 'timestamp', 'Open': 'open', 'High': 'high', 
-                       'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
+    # Calculate VWAP
     df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
     
     # 2. Feature engineering
@@ -395,7 +419,6 @@ def save_to_bigquery(predictions):
 def record_actuals():
     """Record actual prices 60+ minutes after predictions were made"""
     import pandas as pd
-    import yfinance as yf
     from datetime import datetime, timedelta
     from google.cloud import bigquery
     
@@ -421,15 +444,8 @@ def record_actuals():
         prediction_timestamp = result[0].timestamp
         last_price_time = pd.Timestamp(result[0].last_price_time)
         
-        # Download minute data to get actual prices
-        df = yf.download('SPY', period='2d', interval='1m', progress=False)
-        if df.empty:
-            raise ValueError("No market data available")
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-        df = df.reset_index()
-        df.rename(columns={'Datetime': 'timestamp', 'Close': 'close'}, inplace=True)
+        # Download minute data from Finnhub to get actual prices
+        df = download_market_data('SPY', days=2)
         
         # Find actual prices at +15, +30, +45, +60 from the original prediction's base time
         def get_actual_price(df, base_time, minutes_ahead):
@@ -478,53 +494,17 @@ def test_model():
     import numpy as np
     import pandas as pd
     import torch
-    import yfinance as yf
     from datetime import datetime
     from pytorch_forecasting import TimeSeriesDataSet
-    import time
     
     try:
         # Get model (lazy load)
         model, dataset_params, device = get_model()
         
-        # Download historical data with retries (same approach as get_predictions)
-        max_retries = 3
-        df = None
-        last_error = None
+        # Download historical data from Finnhub
+        df = download_market_data('SPY', days=7)
         
-        for attempt in range(max_retries):
-            try:
-                periods = ['5d', '7d', '10d']
-                period = periods[attempt % len(periods)]
-                
-                print(f"Test attempt {attempt + 1}: Downloading SPY data (period={period})...")
-                df = yf.download('SPY', period=period, interval='1m', progress=False)
-                
-                if not df.empty:
-                    print(f"Successfully downloaded {len(df)} rows")
-                    break
-                else:
-                    print(f"Empty dataframe on attempt {attempt + 1}")
-                    
-            except Exception as e:
-                last_error = e
-                print(f"Attempt {attempt + 1} failed: {e}")
-            
-            if attempt < max_retries - 1:
-                time.sleep(2)
-        
-        if df is None or df.empty:
-            return jsonify({
-                'error': f'Could not download historical data after {max_retries} attempts',
-                'last_error': str(last_error),
-                'status': 'failed'
-            }), 500
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-        df = df.reset_index()
-        df.rename(columns={'Datetime': 'timestamp', 'Open': 'open', 'High': 'high', 
-                           'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
+        # Calculate VWAP
         df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
         
         # Feature engineering
