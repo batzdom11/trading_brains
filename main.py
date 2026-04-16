@@ -580,7 +580,200 @@ def test_model():
         print(f"Test error: {str(e)}")
         print(traceback.format_exc())
         return jsonify({'status': 'failed', 'error': str(e)}), 500
-        
+
+
+@app.route('/backfill', methods=['GET', 'POST'])
+def backfill():
+    """Recalculate all historical predictions using the fixed model.predict() pipeline."""
+    import numpy as np
+    import pandas as pd
+    import torch
+    import requests
+    import time as time_module
+    from datetime import datetime, timedelta
+    from google.cloud import bigquery
+    from pytorch_forecasting import TimeSeriesDataSet
+
+    try:
+        model, dataset_params, device = get_model()
+        max_encoder_length = dataset_params.get('max_encoder_length', 60)
+        max_prediction_length = dataset_params.get('max_prediction_length', 60)
+        min_rows = max_encoder_length + max_prediction_length + 100
+
+        # 1. Fetch all prediction rows from BigQuery
+        bq_client = bigquery.Client()
+        query = """
+            SELECT timestamp, last_price, pred_60m
+            FROM `trading-brains.tft_predictions.tft_predictions_logs`
+            ORDER BY timestamp ASC
+        """
+        predictions_df = bq_client.query(query).to_dataframe()
+
+        if predictions_df.empty:
+            return jsonify({'status': 'no_predictions_found'})
+
+        predictions_df['pred_ts'] = pd.to_datetime(predictions_df['timestamp'])
+        predictions_df['date'] = predictions_df['pred_ts'].dt.date
+        days = sorted(predictions_df['date'].unique())
+
+        results = []
+        total_updated = 0
+        total_skipped = 0
+        data_cache = {}
+
+        api_key = os.environ.get('TWELVEDATA_API_KEY')
+        if not api_key:
+            return jsonify({'error': 'TWELVEDATA_API_KEY not set'}), 500
+
+        for day in days:
+            day_preds = predictions_df[predictions_df['date'] == day]
+            day_str = str(day)
+
+            # Download data for this day with lookback
+            if day_str not in data_cache:
+                try:
+                    start_date = (pd.Timestamp(day_str) - timedelta(days=5)).strftime('%Y-%m-%d')
+                    end_date = (pd.Timestamp(day_str) + timedelta(days=1)).strftime('%Y-%m-%d')
+
+                    url = "https://api.twelvedata.com/time_series"
+                    params = {
+                        'symbol': 'SPY',
+                        'interval': '1min',
+                        'outputsize': 5000,
+                        'start_date': start_date,
+                        'end_date': end_date,
+                        'apikey': api_key,
+                        'timezone': 'America/New_York',
+                    }
+                    response = requests.get(url, params=params, timeout=30)
+                    data = response.json()
+
+                    if 'values' not in data or not data['values']:
+                        total_skipped += len(day_preds)
+                        continue
+
+                    df = pd.DataFrame(data['values'])
+                    df['timestamp'] = pd.to_datetime(df['datetime'])
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                    df = df.sort_values('timestamp').reset_index(drop=True)
+
+                    # VWAP + features
+                    df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
+                    df_feat = calculate_all_features(df)
+                    df_feat = df_feat.dropna().reset_index(drop=True)
+                    df_feat['time_idx'] = range(len(df_feat))
+                    df_feat['group'] = 'SPY'
+
+                    numeric_cols = df_feat.select_dtypes(include=[np.number]).columns.tolist()
+                    df_feat[numeric_cols] = df_feat[numeric_cols].replace([np.inf, -np.inf], np.nan)
+                    df_feat[numeric_cols] = df_feat[numeric_cols].ffill().bfill()
+
+                    data_cache[day_str] = df_feat
+                    time_module.sleep(8)  # Twelve Data rate limit
+                except Exception as e:
+                    total_skipped += len(day_preds)
+                    results.append({'day': day_str, 'error': str(e)})
+                    continue
+
+            df_feat = data_cache[day_str]
+
+            for _, row in day_preds.iterrows():
+                pred_ts = row['pred_ts']
+                original_timestamp = row['timestamp']
+
+                mask = df_feat['timestamp'] <= pred_ts
+                df_available = df_feat[mask]
+
+                if len(df_available) < min_rows:
+                    total_skipped += 1
+                    continue
+
+                df_window = df_available.iloc[-min_rows:].copy()
+                df_window['time_idx'] = range(len(df_window))
+
+                try:
+                    prediction_dataset = TimeSeriesDataSet.from_parameters(
+                        dataset_params, df_window, predict=True,
+                    )
+                    pred_dataloader = prediction_dataset.to_dataloader(train=False, batch_size=1, num_workers=0)
+
+                    raw_pred = model.predict(pred_dataloader, mode="prediction")
+                    pred_array = raw_pred.squeeze().cpu().numpy()
+                    if len(pred_array.shape) == 2:
+                        pred_array = pred_array[:, pred_array.shape[1] // 2]
+
+                    last_close = float(df_window['close'].iloc[-(max_prediction_length + 1)])
+                    last_ts = df_window['timestamp'].iloc[-(max_prediction_length + 1)]
+
+                    new_values = {
+                        'last_price': float(last_close),
+                        'last_price_time': str(last_ts),
+                        'pred_15m': float(pred_array[14]),
+                        'pred_30m': float(pred_array[29]),
+                        'pred_45m': float(pred_array[44]),
+                        'pred_60m': float(pred_array[59]),
+                        'return_15m': float((pred_array[14] - last_close) / last_close * 100),
+                        'return_30m': float((pred_array[29] - last_close) / last_close * 100),
+                        'return_45m': float((pred_array[44] - last_close) / last_close * 100),
+                        'return_60m': float((pred_array[59] - last_close) / last_close * 100),
+                    }
+
+                    # Update BigQuery
+                    update_query = """
+                        UPDATE `trading-brains.tft_predictions.tft_predictions_logs`
+                        SET last_price = @last_price,
+                            last_price_time = @last_price_time,
+                            pred_15m = @pred_15m, pred_30m = @pred_30m,
+                            pred_45m = @pred_45m, pred_60m = @pred_60m,
+                            return_15m = @return_15m, return_30m = @return_30m,
+                            return_45m = @return_45m, return_60m = @return_60m
+                        WHERE timestamp = @original_timestamp
+                    """
+                    job_config = bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter("last_price", "FLOAT64", new_values['last_price']),
+                            bigquery.ScalarQueryParameter("last_price_time", "STRING", new_values['last_price_time']),
+                            bigquery.ScalarQueryParameter("pred_15m", "FLOAT64", new_values['pred_15m']),
+                            bigquery.ScalarQueryParameter("pred_30m", "FLOAT64", new_values['pred_30m']),
+                            bigquery.ScalarQueryParameter("pred_45m", "FLOAT64", new_values['pred_45m']),
+                            bigquery.ScalarQueryParameter("pred_60m", "FLOAT64", new_values['pred_60m']),
+                            bigquery.ScalarQueryParameter("return_15m", "FLOAT64", new_values['return_15m']),
+                            bigquery.ScalarQueryParameter("return_30m", "FLOAT64", new_values['return_30m']),
+                            bigquery.ScalarQueryParameter("return_45m", "FLOAT64", new_values['return_45m']),
+                            bigquery.ScalarQueryParameter("return_60m", "FLOAT64", new_values['return_60m']),
+                            bigquery.ScalarQueryParameter("original_timestamp", "STRING", original_timestamp),
+                        ]
+                    )
+                    bq_client.query(update_query, job_config=job_config).result()
+
+                    results.append({
+                        'timestamp': original_timestamp,
+                        'old_pred_60m': float(row['pred_60m']) if pd.notna(row['pred_60m']) else None,
+                        'new_pred_60m': new_values['pred_60m'],
+                        'new_last_price': new_values['last_price'],
+                    })
+                    total_updated += 1
+
+                except Exception as e:
+                    total_skipped += 1
+                    results.append({'timestamp': original_timestamp, 'error': str(e)})
+
+        return jsonify({
+            'status': 'completed',
+            'total_updated': total_updated,
+            'total_skipped': total_skipped,
+            'total_rows': len(predictions_df),
+            'details': results,
+        })
+
+    except Exception as e:
+        import traceback
+        print(f"Backfill error: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
