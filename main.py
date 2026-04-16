@@ -68,6 +68,44 @@ def get_model():
     
     return model, dataset_params, device
 
+def update_normalizer_stats(dataset_params, close_series):
+    """
+    Update the GroupNormalizer's stored center/scale to match current data.
+    
+    The model's normalizer stores training-time statistics (mean ~600, std ~25).
+    When current prices are ~700, the inverse transform anchors predictions to
+    the old range. By updating center/scale with current data, the post-hoc
+    rescaling correctly maps model outputs to current price levels.
+    """
+    import numpy as np
+    import copy
+
+    params = copy.deepcopy(dataset_params)
+    normalizer = params.get("target_normalizer")
+    if normalizer is None or not hasattr(normalizer, "norm_"):
+        return params
+
+    values = close_series.values.astype(float)
+    # Apply the same preprocessing the normalizer uses (softplus_inv)
+    if hasattr(normalizer, "preprocess"):
+        import torch
+        preprocessed = normalizer.preprocess(torch.tensor(values)).numpy()
+    else:
+        preprocessed = values
+
+    new_center = float(np.mean(preprocessed))
+    new_scale = float(np.std(preprocessed) + np.finfo(np.float16).eps)
+
+    for group_id in normalizer.norm_.index:
+        normalizer.norm_.loc[group_id, "center"] = new_center
+        normalizer.norm_.loc[group_id, "scale"] = new_scale
+
+    if hasattr(normalizer, "missing_"):
+        normalizer.missing_["center"] = new_center
+        normalizer.missing_["scale"] = new_scale
+
+    return params
+
 def calculate_all_features(df):
     """
     Calculate all 75 features required for the TFT model.
@@ -370,9 +408,10 @@ def get_predictions():
     df_recent = df_pred.iloc[-min_rows:].copy()
     df_recent['time_idx'] = range(len(df_recent))
     
-    # 4. Create dataset and predict
+    # 4. Update normalizer to current price level and predict
+    updated_params = update_normalizer_stats(dataset_params, df_recent['close'])
     prediction_dataset = TimeSeriesDataSet.from_parameters(
-        dataset_params,
+        updated_params,
         df_recent,
         predict=True,
     )
@@ -544,9 +583,10 @@ def test_model():
         df_recent = df_pred.iloc[-min_rows:].copy()
         df_recent['time_idx'] = range(len(df_recent))
         
-        # Create dataset and predict
+        # Update normalizer to current price level and predict
+        updated_params = update_normalizer_stats(dataset_params, df_recent['close'])
         prediction_dataset = TimeSeriesDataSet.from_parameters(
-            dataset_params,
+            updated_params,
             df_recent,
             predict=True,
         )
@@ -694,8 +734,9 @@ def backfill():
                 df_window['time_idx'] = range(len(df_window))
 
                 try:
+                    updated_params = update_normalizer_stats(dataset_params, df_window['close'])
                     prediction_dataset = TimeSeriesDataSet.from_parameters(
-                        dataset_params, df_window, predict=True,
+                        updated_params, df_window, predict=True,
                     )
                     pred_dataloader = prediction_dataset.to_dataloader(train=False, batch_size=1, num_workers=0)
 
