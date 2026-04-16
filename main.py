@@ -378,21 +378,16 @@ def get_predictions():
     )
     pred_dataloader = prediction_dataset.to_dataloader(train=False, batch_size=1, num_workers=0)
     
-    with torch.no_grad():
-        for x_batch, y_batch in pred_dataloader:
-            pass
-        x_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in x_batch.items()}
-        output = model(x_batch)
-    
-    raw_pred = output.prediction.squeeze().cpu().numpy()
-    if len(raw_pred.shape) == 2:
-        pred_array = raw_pred[:, raw_pred.shape[1] // 2]
-    else:
-        pred_array = raw_pred
+    # Use model.predict() which automatically applies inverse normalization
+    raw_pred = model.predict(pred_dataloader, mode="prediction")
+    pred_array = raw_pred.squeeze().cpu().numpy()
+    if len(pred_array.shape) == 2:
+        pred_array = pred_array[:, pred_array.shape[1] // 2]
     
     # 5. Extract predictions at 15, 30, 45, 60 minutes
-    last_close = df_recent['close'].iloc[-61]
-    last_timestamp = df_recent['timestamp'].iloc[-61]
+    # Last encoder position = end of lookback window (before prediction horizon)
+    last_close = df_recent['close'].iloc[-(max_prediction_length + 1)]
+    last_timestamp = df_recent['timestamp'].iloc[-(max_prediction_length + 1)]
     
     predictions = {
         'timestamp': datetime.utcnow().isoformat(),
@@ -557,19 +552,13 @@ def test_model():
         )
         pred_dataloader = prediction_dataset.to_dataloader(train=False, batch_size=1, num_workers=0)
         
-        with torch.no_grad():
-            for x_batch, y_batch in pred_dataloader:
-                pass
-            x_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in x_batch.items()}
-            output = model(x_batch)
+        # Use model.predict() which automatically applies inverse normalization
+        raw_pred = model.predict(pred_dataloader, mode="prediction")
+        pred_array = raw_pred.squeeze().cpu().numpy()
+        if len(pred_array.shape) == 2:
+            pred_array = pred_array[:, pred_array.shape[1] // 2]
         
-        raw_pred = output.prediction.squeeze().cpu().numpy()
-        if len(raw_pred.shape) == 2:
-            pred_array = raw_pred[:, raw_pred.shape[1] // 2]
-        else:
-            pred_array = raw_pred
-        
-        last_close = df_recent['close'].iloc[-61]
+        last_close = df_recent['close'].iloc[-(max_prediction_length + 1)]
         
         return jsonify({
             'status': 'success',
