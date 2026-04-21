@@ -23,23 +23,20 @@ app = Flask(__name__)
 
 # Global variables for lazy loading
 GCS_BUCKET = "tft-for-trading-brains"
-GCS_MODEL_PATH = "tft_checkpoint_latest.ckpt"
-LOCAL_MODEL_PATH = "/tmp/tft_checkpoint_latest.ckpt"
 
-model = None
-dataset_params = None
-device = None
+# Per-ticker model cache: {ticker: (model, dataset_params, device)}
+_model_cache = {}
 
 @app.route('/')
 def health():
     """Health check endpoint - must respond fast"""
     return jsonify({'status': 'healthy'})
 
-def get_model():
-    """Lazy load model on first request"""
-    global model, dataset_params, device
+def get_model(ticker='SPY'):
+    """Lazy load model on first request, cached per ticker"""
+    global _model_cache
     
-    if model is None:
+    if ticker not in _model_cache:
         import torch
         from google.cloud import storage
         
@@ -53,20 +50,25 @@ def get_model():
         
         from pytorch_forecasting import TemporalFusionTransformer
         
-        print(f"Downloading model from gs://{GCS_BUCKET}/{GCS_MODEL_PATH}...")
+        gcs_model_path = f"tft_checkpoint_{ticker}_latest.ckpt"
+        local_model_path = f"/tmp/tft_checkpoint_{ticker}_latest.ckpt"
+        
+        print(f"Downloading model from gs://{GCS_BUCKET}/{gcs_model_path}...")
         storage_client = storage.Client()
         bucket = storage_client.bucket(GCS_BUCKET)
-        blob = bucket.blob(GCS_MODEL_PATH)
-        blob.download_to_filename(LOCAL_MODEL_PATH)
-        print("Model downloaded successfully!")
+        blob = bucket.blob(gcs_model_path)
+        blob.download_to_filename(local_model_path)
+        print(f"Model for {ticker} downloaded successfully!")
         
-        model = TemporalFusionTransformer.load_from_checkpoint(LOCAL_MODEL_PATH, map_location='cpu')
+        model = TemporalFusionTransformer.load_from_checkpoint(local_model_path, map_location='cpu')
         model.eval()
         dataset_params = model.dataset_parameters
         device = torch.device('cpu')
-        print(f"Model loaded on device: {device}")
+        print(f"Model for {ticker} loaded on device: {device}")
+        
+        _model_cache[ticker] = (model, dataset_params, device)
     
-    return model, dataset_params, device
+    return _model_cache[ticker]
 
 def update_normalizer_stats(dataset_params, close_series):
     """
@@ -370,7 +372,7 @@ def download_market_data(ticker='SPY', days=7):
     
     raise ValueError(f"No market data available after {max_retries} attempts. Last error: {last_error}")
 
-def get_predictions():
+def get_predictions(ticker='SPY'):
     """Download data, engineer features, run model, return predictions"""
     import numpy as np
     import pandas as pd
@@ -379,10 +381,10 @@ def get_predictions():
     from pytorch_forecasting import TimeSeriesDataSet
     
     # Get model (lazy load)
-    model, dataset_params, device = get_model()
+    model, dataset_params, device = get_model(ticker)
     
-    # 1. Download real-time data from Finnhub
-    df = download_market_data('SPY', days=7)
+    # 1. Download real-time data
+    df = download_market_data(ticker, days=7)
     
     # Calculate VWAP
     df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
@@ -435,6 +437,7 @@ def get_predictions():
     
     predictions = {
         'timestamp': datetime.utcnow().isoformat(),
+        'ticker': ticker,
         'last_price': float(last_close),
         'last_price_time': str(last_timestamp),
         'pred_15m': float(pred_array[14]),
@@ -453,7 +456,9 @@ def get_predictions():
 def predict():
     """HTTP endpoint for predictions"""
     try:
-        predictions = get_predictions()
+        from flask import request
+        ticker = request.args.get('ticker', 'SPY')
+        predictions = get_predictions(ticker)
         save_to_bigquery(predictions)
         return jsonify(predictions)
     except Exception as e:
@@ -480,31 +485,46 @@ def record_actuals():
     import pandas as pd
     from datetime import datetime, timedelta
     from google.cloud import bigquery
+    from flask import request
     
     try:
+        ticker = request.args.get('ticker', 'SPY')
+        
         # Get the prediction from ~65 minutes ago
         target_time = datetime.utcnow() - timedelta(minutes=65)
         
         # Query BigQuery for the prediction made around that time
         client = bigquery.Client()
-        query = f"""
-            SELECT timestamp, last_price_time
+        query = """
+            SELECT timestamp, last_price_time, last_price,
+                   pred_15m, pred_30m, pred_45m, pred_60m
             FROM `trading-brains.tft_predictions.tft_predictions_logs`
-            WHERE TIMESTAMP(timestamp) >= TIMESTAMP_SUB(TIMESTAMP('{target_time.isoformat()}'), INTERVAL 10 MINUTE)
-              AND TIMESTAMP(timestamp) <= TIMESTAMP_ADD(TIMESTAMP('{target_time.isoformat()}'), INTERVAL 10 MINUTE)
+            WHERE TIMESTAMP(timestamp) >= TIMESTAMP_SUB(@target_time, INTERVAL 10 MINUTE)
+              AND TIMESTAMP(timestamp) <= TIMESTAMP_ADD(@target_time, INTERVAL 10 MINUTE)
+              AND ticker = @ticker
             ORDER BY timestamp DESC
             LIMIT 1
         """
-        result = list(client.query(query).result())
+        from google.cloud.bigquery import ScalarQueryParameter, QueryJobConfig
+        job_config = QueryJobConfig(query_parameters=[
+            ScalarQueryParameter("target_time", "TIMESTAMP", target_time),
+            ScalarQueryParameter("ticker", "STRING", ticker),
+        ])
+        result = list(client.query(query, job_config=job_config).result())
         
         if not result:
             return jsonify({'status': 'no_prediction_found', 'target_time': target_time.isoformat()})
         
         prediction_timestamp = result[0].timestamp
         last_price_time = pd.Timestamp(result[0].last_price_time)
+        last_price = float(result[0].last_price)
+        pred_15m = float(result[0].pred_15m)
+        pred_30m = float(result[0].pred_30m)
+        pred_45m = float(result[0].pred_45m)
+        pred_60m = float(result[0].pred_60m)
         
-        # Download minute data from Finnhub to get actual prices
-        df = download_market_data('SPY', days=2)
+        # Download minute data to get actual prices
+        df = download_market_data(ticker, days=2)
         
         # Find actual prices at +15, +30, +45, +60 from the original prediction's base time
         def get_actual_price(df, base_time, minutes_ahead):
@@ -522,6 +542,7 @@ def record_actuals():
         # Save to BigQuery
         actuals = {
             'prediction_timestamp': prediction_timestamp,
+            'ticker': ticker,
             'actual_15m_time': actual_15m_time,
             'actual_15m_price': actual_15m_price,
             'actual_30m_time': actual_30m_time,
@@ -539,7 +560,84 @@ def record_actuals():
             print(f"BigQuery errors: {errors}")
             return jsonify({'error': str(errors)}), 500
         
-        return jsonify(actuals)
+        # Compute per-prediction error metrics
+        def _ae(pred, actual):
+            return abs(pred - actual)
+        
+        def _pct_err(pred, actual):
+            return abs(pred - actual) / actual * 100 if actual != 0 else None
+        
+        def _direction_correct(pred, actual, base):
+            """Did the model predict the right direction (up/down) from base price?"""
+            return int((pred - base) * (actual - base) > 0) if (pred != base and actual != base) else None
+        
+        metrics = {
+            'prediction_timestamp': prediction_timestamp,
+            'ticker': ticker,
+            'base_price': last_price,
+            'ae_15m': round(_ae(pred_15m, actual_15m_price), 6),
+            'ae_30m': round(_ae(pred_30m, actual_30m_price), 6),
+            'ae_45m': round(_ae(pred_45m, actual_45m_price), 6),
+            'ae_60m': round(_ae(pred_60m, actual_60m_price), 6),
+            'pct_error_15m': round(_pct_err(pred_15m, actual_15m_price), 4) if _pct_err(pred_15m, actual_15m_price) is not None else None,
+            'pct_error_30m': round(_pct_err(pred_30m, actual_30m_price), 4) if _pct_err(pred_30m, actual_30m_price) is not None else None,
+            'pct_error_45m': round(_pct_err(pred_45m, actual_45m_price), 4) if _pct_err(pred_45m, actual_45m_price) is not None else None,
+            'pct_error_60m': round(_pct_err(pred_60m, actual_60m_price), 4) if _pct_err(pred_60m, actual_60m_price) is not None else None,
+            'direction_correct_15m': _direction_correct(pred_15m, actual_15m_price, last_price),
+            'direction_correct_30m': _direction_correct(pred_30m, actual_30m_price, last_price),
+            'direction_correct_45m': _direction_correct(pred_45m, actual_45m_price, last_price),
+            'direction_correct_60m': _direction_correct(pred_60m, actual_60m_price, last_price),
+            'pred_15m': pred_15m,
+            'pred_30m': pred_30m,
+            'pred_45m': pred_45m,
+            'pred_60m': pred_60m,
+            'actual_15m': actual_15m_price,
+            'actual_30m': actual_30m_price,
+            'actual_45m': actual_45m_price,
+            'actual_60m': actual_60m_price,
+            'recorded_at': datetime.utcnow().isoformat(),
+        }
+        
+        # Write to model_hourly_metrics table (create if needed)
+        metrics_table_id = "trading-brains.tft_predictions.model_hourly_metrics"
+        metrics_schema = [
+            bigquery.SchemaField("prediction_timestamp", "STRING"),
+            bigquery.SchemaField("ticker", "STRING"),
+            bigquery.SchemaField("base_price", "FLOAT64"),
+            bigquery.SchemaField("ae_15m", "FLOAT64"),
+            bigquery.SchemaField("ae_30m", "FLOAT64"),
+            bigquery.SchemaField("ae_45m", "FLOAT64"),
+            bigquery.SchemaField("ae_60m", "FLOAT64"),
+            bigquery.SchemaField("pct_error_15m", "FLOAT64"),
+            bigquery.SchemaField("pct_error_30m", "FLOAT64"),
+            bigquery.SchemaField("pct_error_45m", "FLOAT64"),
+            bigquery.SchemaField("pct_error_60m", "FLOAT64"),
+            bigquery.SchemaField("direction_correct_15m", "INT64"),
+            bigquery.SchemaField("direction_correct_30m", "INT64"),
+            bigquery.SchemaField("direction_correct_45m", "INT64"),
+            bigquery.SchemaField("direction_correct_60m", "INT64"),
+            bigquery.SchemaField("pred_15m", "FLOAT64"),
+            bigquery.SchemaField("pred_30m", "FLOAT64"),
+            bigquery.SchemaField("pred_45m", "FLOAT64"),
+            bigquery.SchemaField("pred_60m", "FLOAT64"),
+            bigquery.SchemaField("actual_15m", "FLOAT64"),
+            bigquery.SchemaField("actual_30m", "FLOAT64"),
+            bigquery.SchemaField("actual_45m", "FLOAT64"),
+            bigquery.SchemaField("actual_60m", "FLOAT64"),
+            bigquery.SchemaField("recorded_at", "TIMESTAMP"),
+        ]
+        try:
+            client.get_table(metrics_table_id)
+        except Exception:
+            table = bigquery.Table(metrics_table_id, schema=metrics_schema)
+            client.create_table(table)
+            print(f"Created BigQuery table: {metrics_table_id}")
+        
+        metrics_errors = client.insert_rows_json(metrics_table_id, [metrics])
+        if metrics_errors:
+            print(f"Metrics BigQuery errors: {metrics_errors}")
+        
+        return jsonify({**actuals, 'metrics': metrics})
         
     except Exception as e:
         import traceback
@@ -555,13 +653,16 @@ def test_model():
     import torch
     from datetime import datetime
     from pytorch_forecasting import TimeSeriesDataSet
+    from flask import request
     
     try:
-        # Get model (lazy load)
-        model, dataset_params, device = get_model()
+        ticker = request.args.get('ticker', 'SPY')
         
-        # Download historical data from Finnhub
-        df = download_market_data('SPY', days=7)
+        # Get model (lazy load)
+        model, dataset_params, device = get_model(ticker)
+        
+        # Download historical data
+        df = download_market_data(ticker, days=7)
         
         # Calculate VWAP
         df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()

@@ -30,9 +30,126 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from pytorch_forecasting import TimeSeriesDataSet, GroupNormalizer, TemporalFusionTransformer
 from pytorch_forecasting.metrics import QuantileLoss
-from google.cloud import storage
+from google.cloud import bigquery, storage
 
 from features import calculate_all_features
+
+
+BQ_DATASET = "tft_predictions"
+BQ_TABLE = "retraining_eval_logs"
+
+
+def log_eval_metrics_to_bq(
+    best_model_path: str,
+    training: TimeSeriesDataSet,
+    val_dataloader,
+    trainer: pl.Trainer,
+    args,
+    data_start: str,
+    data_end: str,
+    training_rows: int,
+    validation_rows: int,
+    best_val_loss: float,
+    gcs_model_uri: str,
+):
+    """Compute evaluation metrics on validation set and log to BigQuery."""
+    print("\nComputing evaluation metrics on validation set...")
+
+    # Load best model
+    best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+
+    # Get predictions
+    predictions = best_tft.predict(val_dataloader, return_x=True)
+    # predictions.output is (batch, prediction_length, quantiles) – median is index 3 of 7 quantiles
+    pred_values = predictions.output[:, :, 3]  # median quantile
+    actuals = predictions.x["decoder_target"][:, :, 0] if predictions.x["decoder_target"].dim() == 3 else predictions.x["decoder_target"]
+
+    pred_np = pred_values.detach().cpu().numpy().flatten()
+    actual_np = actuals.detach().cpu().numpy().flatten()
+
+    # Compute metrics
+    errors = actual_np - pred_np
+    mae = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+    # MAPE: guard against zero actuals
+    mask = actual_np != 0
+    mape = float(np.mean(np.abs(errors[mask] / actual_np[mask])) * 100) if mask.any() else None
+    # R²
+    ss_res = np.sum(errors ** 2)
+    ss_tot = np.sum((actual_np - np.mean(actual_np)) ** 2)
+    r_squared = float(1 - ss_res / ss_tot) if ss_tot != 0 else None
+
+    print(f"  MAE:        {mae:.4f}")
+    print(f"  RMSE:       {rmse:.4f}")
+    print(f"  MAPE:       {mape:.4f}%" if mape is not None else "  MAPE:       N/A")
+    print(f"  R²:         {r_squared:.4f}" if r_squared is not None else "  R²:         N/A")
+
+    # Build row
+    row = {
+        "run_timestamp": datetime.utcnow().isoformat(),
+        "symbol": args.symbol,
+        "best_val_loss": round(float(best_val_loss), 6),
+        "mae": round(mae, 6),
+        "rmse": round(rmse, 6),
+        "mape": round(mape, 6) if mape is not None else None,
+        "r_squared": round(r_squared, 6) if r_squared is not None else None,
+        "epochs_trained": trainer.current_epoch + 1,
+        "max_epochs": args.max_epochs,
+        "batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "hidden_size": args.hidden_size,
+        "attention_head_size": args.attention_head_size,
+        "dropout": args.dropout,
+        "patience": args.patience,
+        "lookback_days": args.lookback_days,
+        "data_start_date": data_start,
+        "data_end_date": data_end,
+        "training_rows": training_rows,
+        "validation_rows": validation_rows,
+        "model_gcs_path": gcs_model_uri,
+    }
+
+    # Insert into BigQuery (create table if needed)
+    bq_client = bigquery.Client()
+    table_id = f"{bq_client.project}.{BQ_DATASET}.{BQ_TABLE}"
+
+    schema = [
+        bigquery.SchemaField("run_timestamp", "TIMESTAMP"),
+        bigquery.SchemaField("symbol", "STRING"),
+        bigquery.SchemaField("best_val_loss", "FLOAT64"),
+        bigquery.SchemaField("mae", "FLOAT64"),
+        bigquery.SchemaField("rmse", "FLOAT64"),
+        bigquery.SchemaField("mape", "FLOAT64"),
+        bigquery.SchemaField("r_squared", "FLOAT64"),
+        bigquery.SchemaField("epochs_trained", "INT64"),
+        bigquery.SchemaField("max_epochs", "INT64"),
+        bigquery.SchemaField("batch_size", "INT64"),
+        bigquery.SchemaField("learning_rate", "FLOAT64"),
+        bigquery.SchemaField("hidden_size", "INT64"),
+        bigquery.SchemaField("attention_head_size", "INT64"),
+        bigquery.SchemaField("dropout", "FLOAT64"),
+        bigquery.SchemaField("patience", "INT64"),
+        bigquery.SchemaField("lookback_days", "INT64"),
+        bigquery.SchemaField("data_start_date", "STRING"),
+        bigquery.SchemaField("data_end_date", "STRING"),
+        bigquery.SchemaField("training_rows", "INT64"),
+        bigquery.SchemaField("validation_rows", "INT64"),
+        bigquery.SchemaField("model_gcs_path", "STRING"),
+    ]
+
+    # Create table if it doesn't exist
+    try:
+        bq_client.get_table(table_id)
+    except Exception:
+        table = bigquery.Table(table_id, schema=schema)
+        bq_client.create_table(table)
+        print(f"  Created BigQuery table: {table_id}")
+
+    errors_bq = bq_client.insert_rows_json(table_id, [row])
+    if errors_bq:
+        print(f"  BigQuery insert errors: {errors_bq}")
+    else:
+        print(f"  Metrics logged to {table_id}")
 
 
 def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key: str) -> pd.DataFrame:
@@ -255,14 +372,29 @@ def train_model(args):
 
     # Upload timestamped copy
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    timestamped_path = f"tft_checkpoint_{timestamp}.ckpt"
+    timestamped_path = f"tft_checkpoint_{args.symbol}_{timestamp}.ckpt"
     blob_ts = bucket.blob(timestamped_path)
     blob_ts.upload_from_filename(best_model_path)
 
     print(f"Uploaded: gs://{args.gcs_bucket}/{args.gcs_model_path}")
     print(f"Uploaded: gs://{args.gcs_bucket}/{timestamped_path}")
 
-    # 9. Summary
+    # 9. Log evaluation metrics to BigQuery
+    log_eval_metrics_to_bq(
+        best_model_path=best_model_path,
+        training=training,
+        val_dataloader=val_dataloader,
+        trainer=trainer,
+        args=args,
+        data_start=str(df["timestamp"].min()),
+        data_end=str(df["timestamp"].max()),
+        training_rows=len(df_tft[df_tft["time_idx"] <= training_cutoff]),
+        validation_rows=len(df_tft[df_tft["time_idx"] > training_cutoff]),
+        best_val_loss=best_val_loss,
+        gcs_model_uri=f"gs://{args.gcs_bucket}/{args.gcs_model_path}",
+    )
+
+    # 10. Summary
     print("\n" + "=" * 60)
     print("Training complete!")
     print(f"  Epochs trained: {trainer.current_epoch + 1}")
@@ -278,7 +410,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train TFT model")
     parser.add_argument("--polygon_api_key", required=True, help="Polygon.io API key")
     parser.add_argument("--gcs_bucket", default="tft-for-trading-brains", help="GCS bucket for model")
-    parser.add_argument("--gcs_model_path", default="tft_checkpoint_latest.ckpt", help="GCS path for model")
+    parser.add_argument("--gcs_model_path", default=None, help="GCS path for model (default: tft_checkpoint_{symbol}_latest.ckpt)")
     parser.add_argument("--symbol", default="SPY", help="Ticker symbol")
     parser.add_argument("--lookback_days", type=int, default=420, help="Days of history to fetch")
     parser.add_argument("--max_epochs", type=int, default=10, help="Max training epochs")
@@ -289,5 +421,9 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
     args = parser.parse_args()
+
+    # Default GCS model path includes symbol for multi-ticker support
+    if args.gcs_model_path is None:
+        args.gcs_model_path = f"tft_checkpoint_{args.symbol}_latest.ckpt"
 
     train_model(args)

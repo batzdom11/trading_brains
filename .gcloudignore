@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+checkpoints/
+models/
+lightning_logs/
+pipeline/
+.git/
+*.ipynb
+_bq_backfill_ticker.py

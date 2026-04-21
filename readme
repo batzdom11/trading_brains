@@ -1,12 +1,14 @@
 # Trading Brains — TFT Price Prediction
 
-Hourly S&P 500 (SPY) price predictions using a Temporal Fusion Transformer (TFT),
-served via Cloud Run and retrained on Vertex AI.
+Hourly stock/ETF price predictions using a Temporal Fusion Transformer (TFT),
+served via Cloud Run and retrained on Vertex AI. Each ticker (e.g. SPY, GOOG)
+has its own trained model, stored separately in GCS.
 
 
 ## Architecture Overview
 
-Polygon.io (training data) Twelve Data (inference data)
+Polygon.io (training data) 
+Twelve Data (inference data)
 | |
 v v
 Vertex AI Custom Job Cloud Run Service
@@ -14,9 +16,9 @@ Vertex AI Custom Job Cloud Run Service
 | |
 v v
 gs://tft-for-trading-brains/ BigQuery: tft_predictions_logs
-tft_checkpoint_latest.ckpt
+tft_checkpoint_{TICKER}_latest.ckpt (with ticker column)
 |
-+-------> Cloud Run loads on cold start
++-------> Cloud Run loads per-ticker on first request
 
 
 
@@ -29,15 +31,71 @@ tft_checkpoint_latest.ckpt
 | Cloud Run URL          | `https://tft-predictions-137489665103.europe-west6.run.app` |
 | Serving container      | `gcr.io/trading-brains/tft-predictions`                  |
 | Training container     | `gcr.io/trading-brains/tft-training`                     |
-| Model checkpoint (GCS) | `gs://tft-for-trading-brains/tft_checkpoint_latest.ckpt` |
-| Predictions log        | `trading-brains.tft_predictions.tft_predictions_logs`    |
-| Actuals log            | `trading-brains.tft_predictions.tft_actuals`             |
+| Model checkpoints (GCS)| `gs://tft-for-trading-brains/tft_checkpoint_{TICKER}_latest.ckpt` |
+| Predictions log        | `trading-brains.tft_predictions.tft_predictions_logs` (with `ticker` column) |
+| Actuals log            | `trading-brains.tft_predictions.tft_actuals` (with `ticker` column) |
+| Eval metrics log       | `trading-brains.tft_predictions.retraining_eval_logs` (with `symbol` column) |
+
+
+## Supported Tickers
+
+| Ticker | Name            | Model checkpoint                        | Status   |
+|--------|-----------------|-----------------------------------------|----------|
+| SPY    | S&P 500 ETF     | `tft_checkpoint_SPY_latest.ckpt`        | Active   |
+| GOOG   | Alphabet Inc.   | `tft_checkpoint_GOOG_latest.ckpt`       | Active   |
+
+### Adding a New Ticker
+
+Replace `AAPL` below with the desired Polygon.io ticker symbol.
+
+**Step 1 — Train the model** (Vertex AI, ~12 hours):
+
+    gcloud ai custom-jobs create ^
+    --region=europe-west6 ^
+    --project=trading-brains ^
+    --display-name=tft-retrain-AAPL ^
+    --worker-pool-spec=machine-type=n1-standard-8,replica-count=1,container-image-uri=gcr.io/trading-brains/tft-training ^
+    --args="--polygon_api_key=IYHqABfrpYN6yfa7bFS9LLNxwJzpn0YE,--gcs_bucket=tft-for-trading-brains,--symbol=AAPL,--max_epochs=25,--lookback_days=425"
+
+This fetches 1-min data from Polygon, trains a TFT, uploads the checkpoint to
+`gs://tft-for-trading-brains/tft_checkpoint_AAPL_latest.ckpt`, and logs
+evaluation metrics to the `retraining_eval_logs` BigQuery table.
+
+**Step 2 — Verify the model works** (after training job completes):
+
+    curl "https://tft-predictions-137489665103.europe-west6.run.app/test?ticker=AAPL"
+
+**Step 3 — Create Cloud Scheduler jobs** for automated hourly predictions:
+
+    gcloud scheduler jobs create http tft-hourly-prediction-aapl ^
+    --location=europe-west6 ^
+    --project=trading-brains ^
+    --uri="https://tft-predictions-137489665103.europe-west6.run.app/predict?ticker=AAPL" ^
+    --http-method=POST ^
+    --schedule="0 10-16 * * 1-5" ^
+    --time-zone=America/New_York ^
+    --attempt-deadline=180s
+
+    gcloud scheduler jobs create http tft-record-actuals-aapl ^
+    --location=europe-west6 ^
+    --project=trading-brains ^
+    --uri="https://tft-predictions-137489665103.europe-west6.run.app/record_actuals?ticker=AAPL" ^
+    --http-method=POST ^
+    --schedule="5 11-17 * * 1-5" ^
+    --time-zone=America/New_York ^
+    --attempt-deadline=180s
+
+**Step 4 — Update this readme**: add the new ticker to the Supported Tickers
+table above and to the Cloud Scheduler Jobs table in the API Endpoints section.
+
+No code changes or container rebuilds are needed — the serving container
+automatically loads the correct per-ticker model from GCS on first request.
 
 
 ## Model Details
 
 - **Framework**: pytorch-forecasting 1.6.1 `TemporalFusionTransformer`
-- **Target**: `close` (SPY 1-min close price)
+- **Target**: `close` (1-min close price, per-ticker model)
 - **Prediction horizon**: 60 minutes ahead (quantile predictions at 15/30/45/60 min)
 - **Encoder length**: 60 time steps
 - **Normalizer**: `GroupNormalizer(groups=["group"], transformation="softplus")`
@@ -79,7 +137,21 @@ trading_brains/
 | `/record_actuals` | GET/POST | Record actual prices for past predictions      |
 | `/backfill`       | GET/POST | Recalculate all historical predictions         |
 
-Predictions are triggered hourly by a Cloud Scheduler job.
+All endpoints accept a `?ticker=` query parameter (default: `SPY`). Examples:
+- `/predict?ticker=SPY`
+- `/predict?ticker=GOOG`
+- `/test?ticker=GOOG`
+
+Predictions are triggered hourly by Cloud Scheduler jobs (one pair per ticker).
+
+### Cloud Scheduler Jobs
+
+| Job name                     | URI                              | Schedule (ET)         |
+|------------------------------|----------------------------------|-----------------------|
+| `tft-hourly-prediction`      | `/predict` (SPY)                 | `:00` 10am–4pm Mon–Fri|
+| `tft-record-actuals`         | `/record_actuals` (SPY)          | `:05` 11am–5pm Mon–Fri|
+| `tft-hourly-prediction-goog` | `/predict?ticker=GOOG`           | `:00` 10am–4pm Mon–Fri|
+| `tft-record-actuals-goog`    | `/record_actuals?ticker=GOOG`    | `:05` 11am–5pm Mon–Fri|
 
 
 ## Environment Variables
@@ -97,16 +169,25 @@ Predictions are triggered hourly by a Cloud Scheduler job.
 gcloud builds submit --tag gcr.io/trading-brains/tft-training --project trading-brains c:\Users\batzi\OneDrive\Dokumente\trading_brains\pipeline
 
 ### 2. Submit a retraining job on Vertex AI
+### Retrain SPY
 gcloud ai custom-jobs create ^
 --region=europe-west6 ^
 --project=trading-brains ^
---display-name=tft-retrain ^
+--display-name=tft-retrain-SPY ^
 --worker-pool-spec=machine-type=n1-standard-8,replica-count=1,container-image-uri=gcr.io/trading-brains/tft-training ^
---args="--polygon_api_key=IYHqABfrpYN6yfa7bFS9LLNxwJzpn0YE,--gcs_bucket=tft-for-trading-brains,--gcs_model_path=tft_checkpoint_latest.ckpt,--max_epochs=25,--lookback_days=425"
+--args="--polygon_api_key=IYHqABfrpYN6yfa7bFS9LLNxwJzpn0YE,--gcs_bucket=tft-for-trading-brains,--symbol=SPY,--max_epochs=25,--lookback_days=425"
 
+### Retrain GOOG
+gcloud ai custom-jobs create ^
+--region=europe-west6 ^
+--project=trading-brains ^
+--display-name=tft-retrain-GOOG ^
+--worker-pool-spec=machine-type=n1-standard-8,replica-count=1,container-image-uri=gcr.io/trading-brains/tft-training ^
+--args="--polygon_api_key=IYHqABfrpYN6yfa7bFS9LLNxwJzpn0YE,--gcs_bucket=tft-for-trading-brains,--symbol=GOOG,--max_epochs=25,--lookback_days=425"
 
-The job fetches fresh 1-min SPY data from Polygon, trains the TFT, and uploads the
-best checkpoint to GCS. Cloud Run picks up the new model on next cold start.
+The `--symbol` flag determines which ticker to fetch from Polygon and where to store
+the model (`tft_checkpoint_{SYMBOL}_latest.ckpt`). Cloud Run loads the per-ticker model
+on first request and caches it in memory.
 
 ### Training arguments
 
@@ -114,9 +195,9 @@ best checkpoint to GCS. Cloud Run picks up the new model on next cold start.
 |-----------------------|---------|---------------------------------|
 | `--polygon_api_key`   | required| Polygon.io API key              |
 | `--gcs_bucket`        | tft-for-trading-brains | GCS bucket for model |
-| `--gcs_model_path`    | tft_checkpoint_latest.ckpt | GCS path for model |
+| `--gcs_model_path`    | tft_checkpoint_{symbol}_latest.ckpt | GCS path (auto-set per ticker) |
 | `--symbol`            | SPY     | Ticker symbol                   |
-| `--lookback_days`     | 365     | Days of historical data         |
+| `--lookback_days`     | 420     | Days of historical data         |
 | `--max_epochs`        | 10      | Maximum training epochs         |
 | `--batch_size`        | 64      | Training batch size             |
 | `--learning_rate`     | 0.001   | Learning rate                   |
