@@ -275,6 +275,7 @@ def calculate_all_features(df):
     df['minute_sin'] = np.sin(2 * np.pi * df['minute'] / 60)
     df['minute_cos'] = np.cos(2 * np.pi * df['minute'] / 60)
     df['day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+    df['day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
     
     # ========================
     # 15. VOLUME LAGS (5 features)
@@ -391,6 +392,10 @@ def get_predictions():
     
     # 3. Prepare for prediction
     df_pred = df_features.copy()
+    # Target columns only needed for training; fill to prevent dropna from dropping last 60 rows
+    for col in ['target_close_60m', 'target_return_60m']:
+        if col in df_pred.columns:
+            df_pred[col] = df_pred[col].ffill().fillna(0)
     df_pred = df_pred.dropna()
     df_pred = df_pred.reset_index(drop=True)
     df_pred['time_idx'] = range(len(df_pred))
@@ -566,6 +571,10 @@ def test_model():
         
         # Prepare for prediction
         df_pred = df_features.copy()
+        # Target columns only needed for training; fill to prevent dropna from dropping last 60 rows
+        for col in ['target_close_60m', 'target_return_60m']:
+            if col in df_pred.columns:
+                df_pred[col] = df_pred[col].ffill().fillna(0)
         df_pred = df_pred.dropna()
         df_pred = df_pred.reset_index(drop=True)
         df_pred['time_idx'] = range(len(df_pred))
@@ -631,6 +640,7 @@ def backfill():
     import requests
     import time as time_module
     from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
     from google.cloud import bigquery
     from pytorch_forecasting import TimeSeriesDataSet
 
@@ -702,6 +712,10 @@ def backfill():
                     # VWAP + features
                     df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
                     df_feat = calculate_all_features(df)
+                    # Target columns only needed for training; fill to prevent dropna from dropping last 60 rows
+                    for col in ['target_close_60m', 'target_return_60m']:
+                        if col in df_feat.columns:
+                            df_feat[col] = df_feat[col].ffill().fillna(0)
                     df_feat = df_feat.dropna().reset_index(drop=True)
                     df_feat['time_idx'] = range(len(df_feat))
                     df_feat['group'] = 'SPY'
@@ -723,7 +737,9 @@ def backfill():
                 pred_ts = row['pred_ts']
                 original_timestamp = row['timestamp']
 
-                mask = df_feat['timestamp'] <= pred_ts
+                # Convert UTC prediction time to NY time for proper comparison with market data
+                pred_ts_ny = pred_ts.tz_localize('UTC').astimezone(ZoneInfo('America/New_York')).replace(tzinfo=None)
+                mask = df_feat['timestamp'] <= pred_ts_ny
                 df_available = df_feat[mask]
 
                 if len(df_available) < min_rows:

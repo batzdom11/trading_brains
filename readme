@@ -1,0 +1,149 @@
+# Trading Brains — TFT Price Prediction
+
+Hourly S&P 500 (SPY) price predictions using a Temporal Fusion Transformer (TFT),
+served via Cloud Run and retrained on Vertex AI.
+
+
+## Architecture Overview
+
+Polygon.io (training data) Twelve Data (inference data)
+| |
+v v
+Vertex AI Custom Job Cloud Run Service
+(pipeline/train.py) (main.py)
+| |
+v v
+gs://tft-for-trading-brains/ BigQuery: tft_predictions_logs
+tft_checkpoint_latest.ckpt
+|
++-------> Cloud Run loads on cold start
+
+
+
+## GCP Resources
+
+| Resource               | Details                                                  |
+|------------------------|----------------------------------------------------------|
+| Project                | `trading-brains` (137489665103)                          |
+| Cloud Run              | `tft-predictions` in `europe-west6`                      |
+| Cloud Run URL          | `https://tft-predictions-137489665103.europe-west6.run.app` |
+| Serving container      | `gcr.io/trading-brains/tft-predictions`                  |
+| Training container     | `gcr.io/trading-brains/tft-training`                     |
+| Model checkpoint (GCS) | `gs://tft-for-trading-brains/tft_checkpoint_latest.ckpt` |
+| Predictions log        | `trading-brains.tft_predictions.tft_predictions_logs`    |
+| Actuals log            | `trading-brains.tft_predictions.tft_actuals`             |
+
+
+## Model Details
+
+- **Framework**: pytorch-forecasting 1.6.1 `TemporalFusionTransformer`
+- **Target**: `close` (SPY 1-min close price)
+- **Prediction horizon**: 60 minutes ahead (quantile predictions at 15/30/45/60 min)
+- **Encoder length**: 60 time steps
+- **Normalizer**: `GroupNormalizer(groups=["group"], transformation="softplus")`
+- **Loss**: `QuantileLoss()` (7 quantiles)
+- **Hyperparameters**: hidden_size=32, attention_head_size=2, dropout=0.1, lr=0.001, hidden_continuous_size=16, output_size=7
+- **Features**: 76 engineered features (returns, SMA, MACD, volatility, ATR, Bollinger bands, RSI, stochastic, ROC, volume indicators, OBV/VPT/MFI, VWAP ratios, time features, volume lags)
+
+
+## Project Structure
+
+trading_brains/
+├── main.py # Cloud Run serving app (Flask)
+├── Dockerfile # Serving container
+├── requirements.txt # Serving dependencies
+├── .env # API keys (gitignored)
+├── pipeline/
+│ ├── train.py # Training script for Vertex AI
+│ ├── features.py # Feature engineering (shared logic with main.py)
+│ ├── run_pipeline.py # Python script to submit Vertex AI jobs
+│ ├── Dockerfile # Training container
+│ └── requirements.txt # Training dependencies
+├── temporal_transformers_exploration.ipynb # Original training notebook
+├── prediction_logs_analytics.ipynb # Prediction analysis
+├── trading_simulation.ipynb # Trading simulation
+├── checkpoints/ # Local training checkpoints
+├── models/ # Local model copies
+└── readme # This file
+
+
+
+
+## API Endpoints (Cloud Run)
+
+| Endpoint          | Method   | Description                                    |
+|-------------------|----------|------------------------------------------------|
+| `/`               | GET      | Health check                                   |
+| `/predict`        | GET/POST | Generate predictions, save to BigQuery         |
+| `/test`           | GET/POST | Test model with historical data (no BQ write)  |
+| `/record_actuals` | GET/POST | Record actual prices for past predictions      |
+| `/backfill`       | GET/POST | Recalculate all historical predictions         |
+
+Predictions are triggered hourly by a Cloud Scheduler job.
+
+
+## Environment Variables
+
+| Variable               | Used by       | Description              |
+|------------------------|---------------|--------------------------|
+| `TWELVEDATA_API_KEY`   | Cloud Run     | Twelve Data API key      |
+| `POLYGON_API_KEY`      | Training      | Polygon.io API key       |
+| `PORT`                 | Cloud Run     | Server port (default 8080) |
+
+
+## Retraining the Model
+
+### 1. Rebuild the training container (only if train.py or features.py changed)
+gcloud builds submit --tag gcr.io/trading-brains/tft-training --project trading-brains c:\Users\batzi\OneDrive\Dokumente\trading_brains\pipeline
+
+### 2. Submit a retraining job on Vertex AI
+gcloud ai custom-jobs create ^
+--region=europe-west6 ^
+--project=trading-brains ^
+--display-name=tft-retrain ^
+--worker-pool-spec=machine-type=n1-standard-8,replica-count=1,container-image-uri=gcr.io/trading-brains/tft-training ^
+--args="--polygon_api_key=IYHqABfrpYN6yfa7bFS9LLNxwJzpn0YE,--gcs_bucket=tft-for-trading-brains,--gcs_model_path=tft_checkpoint_latest.ckpt,--max_epochs=25,--lookback_days=425"
+
+
+The job fetches fresh 1-min SPY data from Polygon, trains the TFT, and uploads the
+best checkpoint to GCS. Cloud Run picks up the new model on next cold start.
+
+### Training arguments
+
+| Argument              | Default | Description                     |
+|-----------------------|---------|---------------------------------|
+| `--polygon_api_key`   | required| Polygon.io API key              |
+| `--gcs_bucket`        | tft-for-trading-brains | GCS bucket for model |
+| `--gcs_model_path`    | tft_checkpoint_latest.ckpt | GCS path for model |
+| `--symbol`            | SPY     | Ticker symbol                   |
+| `--lookback_days`     | 365     | Days of historical data         |
+| `--max_epochs`        | 10      | Maximum training epochs         |
+| `--batch_size`        | 64      | Training batch size             |
+| `--learning_rate`     | 0.001   | Learning rate                   |
+| `--hidden_size`       | 32      | TFT hidden size                 |
+| `--attention_head_size`| 2      | Number of attention heads       |
+| `--dropout`           | 0.1     | Dropout rate                    |
+| `--patience`          | 10      | Early stopping patience         |
+
+### Monitor the job
+
+Check status in the Vertex AI Custom Jobs console:
+https://console.cloud.google.com/vertex-ai/training/custom-jobs?project=trading-brains
+
+Or via CLI:
+gcloud ai custom-jobs list --region=europe-west6 --project=trading-brains --limit=5
+
+
+## Deploying the Serving Container
+
+After changes to `main.py`:
+
+gcloud builds submit --tag gcr.io/trading-brains/tft-predictions --project trading-brains c:\Users\batzi\OneDrive\Dokumente\trading_brains
+
+gcloud run deploy tft-predictions --image gcr.io/trading-brains/tft-predictions --region europe-west6 --project trading-brains
+
+
+## Data Sources
+
+- **Training**: Polygon.io REST API — 1-min OHLCV bars (free tier returns "DELAYED" status, which is fine for historical data)
+- **Inference**: Twelve Data API — 1-min OHLCV bars (real-time for predictions)
