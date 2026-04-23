@@ -43,6 +43,9 @@ tft_checkpoint_{TICKER}_latest.ckpt (with ticker column)
 |--------|-----------------|-----------------------------------------|----------|
 | SPY    | S&P 500 ETF     | `tft_checkpoint_SPY_latest.ckpt`        | Active   |
 | GOOG   | Alphabet Inc.   | `tft_checkpoint_GOOG_latest.ckpt`       | Active   |
+| QQQ    | Nasdaq-100 ETF  | `tft_checkpoint_QQQ_latest.ckpt`        | Training |
+| TSLA   | Tesla Inc.      | `tft_checkpoint_TSLA_latest.ckpt`       | Training |
+| AAPL   | Apple Inc.      | `tft_checkpoint_AAPL_latest.ckpt`       | Training |
 
 ### Adding a New Ticker
 
@@ -152,6 +155,12 @@ Predictions are triggered hourly by Cloud Scheduler jobs (one pair per ticker).
 | `tft-record-actuals`         | `/record_actuals` (SPY)          | `:05` 11am–5pm Mon–Fri|
 | `tft-hourly-prediction-goog` | `/predict?ticker=GOOG`           | `:00` 10am–4pm Mon–Fri|
 | `tft-record-actuals-goog`    | `/record_actuals?ticker=GOOG`    | `:05` 11am–5pm Mon–Fri|
+| `tft-hourly-prediction-qqq`  | `/predict?ticker=QQQ`            | `:00` 10am–4pm Mon–Fri|
+| `tft-record-actuals-qqq`     | `/record_actuals?ticker=QQQ`     | `:05` 11am–5pm Mon–Fri|
+| `tft-hourly-prediction-tsla` | `/predict?ticker=TSLA`           | `:00` 10am–4pm Mon–Fri|
+| `tft-record-actuals-tsla`    | `/record_actuals?ticker=TSLA`    | `:05` 11am–5pm Mon–Fri|
+| `tft-hourly-prediction-aapl` | `/predict?ticker=AAPL`           | `:00` 10am–4pm Mon–Fri|
+| `tft-record-actuals-aapl`    | `/record_actuals?ticker=AAPL`    | `:05` 11am–5pm Mon–Fri|
 
 
 ## Environment Variables

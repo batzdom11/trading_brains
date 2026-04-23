@@ -17,7 +17,7 @@ if hasattr(torch.backends, 'cudnn'):
     torch.backends.cudnn.enabled = False
     torch.backends.cudnn.is_available = lambda: False
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
@@ -69,6 +69,18 @@ def get_model(ticker='SPY'):
         _model_cache[ticker] = (model, dataset_params, device)
     
     return _model_cache[ticker]
+
+
+def get_model_group(dataset_params):
+    """Get the group value from the model's categorical encoders."""
+    known_groups = dataset_params.get('categorical_encoders', {}).get('__group_id__group', None)
+    if known_groups and hasattr(known_groups, 'classes_'):
+        classes = known_groups.classes_
+        if isinstance(classes, dict):
+            return list(classes.keys())[0]
+        else:
+            return classes[0]
+    return 'SPY'
 
 def update_normalizer_stats(dataset_params, close_series):
     """
@@ -401,7 +413,7 @@ def get_predictions(ticker='SPY'):
     df_pred = df_pred.dropna()
     df_pred = df_pred.reset_index(drop=True)
     df_pred['time_idx'] = range(len(df_pred))
-    df_pred['group'] = 'SPY'
+    df_pred['group'] = get_model_group(dataset_params)
     
     # Clean data
     numeric_cols = df_pred.select_dtypes(include=[np.number]).columns.tolist()
@@ -679,7 +691,7 @@ def test_model():
         df_pred = df_pred.dropna()
         df_pred = df_pred.reset_index(drop=True)
         df_pred['time_idx'] = range(len(df_pred))
-        df_pred['group'] = 'SPY'
+        df_pred['group'] = get_model_group(dataset_params)
         
         # Clean data
         numeric_cols = df_pred.select_dtypes(include=[np.number]).columns.tolist()
@@ -740,25 +752,31 @@ def backfill():
     import torch
     import requests
     import time as time_module
+    import traceback
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
     from google.cloud import bigquery
     from pytorch_forecasting import TimeSeriesDataSet
 
     try:
-        model, dataset_params, device = get_model()
+        ticker = request.args.get('ticker', 'SPY')
+        model, dataset_params, device = get_model(ticker)
         max_encoder_length = dataset_params.get('max_encoder_length', 60)
         max_prediction_length = dataset_params.get('max_prediction_length', 60)
         min_rows = max_encoder_length + max_prediction_length + 100
 
-        # 1. Fetch all prediction rows from BigQuery
+        # 1. Fetch all prediction rows from BigQuery for this ticker
         bq_client = bigquery.Client()
         query = """
             SELECT timestamp, last_price, pred_60m
             FROM `trading-brains.tft_predictions.tft_predictions_logs`
+            WHERE ticker = @ticker
             ORDER BY timestamp ASC
         """
-        predictions_df = bq_client.query(query).to_dataframe()
+        job_cfg = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)]
+        )
+        predictions_df = bq_client.query(query, job_config=job_cfg).to_dataframe()
 
         if predictions_df.empty:
             return jsonify({'status': 'no_predictions_found'})
@@ -788,7 +806,7 @@ def backfill():
 
                     url = "https://api.twelvedata.com/time_series"
                     params = {
-                        'symbol': 'SPY',
+                        'symbol': ticker,
                         'interval': '1min',
                         'outputsize': 5000,
                         'start_date': start_date,
@@ -819,7 +837,7 @@ def backfill():
                             df_feat[col] = df_feat[col].ffill().fillna(0)
                     df_feat = df_feat.dropna().reset_index(drop=True)
                     df_feat['time_idx'] = range(len(df_feat))
-                    df_feat['group'] = 'SPY'
+                    df_feat['group'] = get_model_group(dataset_params)
 
                     numeric_cols = df_feat.select_dtypes(include=[np.number]).columns.tolist()
                     df_feat[numeric_cols] = df_feat[numeric_cols].replace([np.inf, -np.inf], np.nan)
@@ -829,7 +847,7 @@ def backfill():
                     time_module.sleep(8)  # Twelve Data rate limit
                 except Exception as e:
                     total_skipped += len(day_preds)
-                    results.append({'day': day_str, 'error': str(e)})
+                    results.append({'day': day_str, 'error': f"{type(e).__name__}: {e}", 'traceback': traceback.format_exc()})
                     continue
 
             df_feat = data_cache[day_str]
@@ -888,6 +906,7 @@ def backfill():
                             return_15m = @return_15m, return_30m = @return_30m,
                             return_45m = @return_45m, return_60m = @return_60m
                         WHERE timestamp = @original_timestamp
+                          AND ticker = @ticker
                     """
                     job_config = bigquery.QueryJobConfig(
                         query_parameters=[
@@ -902,6 +921,7 @@ def backfill():
                             bigquery.ScalarQueryParameter("return_45m", "FLOAT64", new_values['return_45m']),
                             bigquery.ScalarQueryParameter("return_60m", "FLOAT64", new_values['return_60m']),
                             bigquery.ScalarQueryParameter("original_timestamp", "STRING", original_timestamp),
+                            bigquery.ScalarQueryParameter("ticker", "STRING", ticker),
                         ]
                     )
                     bq_client.query(update_query, job_config=job_config).result()
@@ -931,6 +951,379 @@ def backfill():
         print(f"Backfill error: {str(e)}")
         print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/backfill_actuals', methods=['GET'])
+def backfill_actuals():
+    """Backfill actual prices for historical predictions so vw_actual_vs_predicted has data."""
+    import pandas as pd
+    import requests
+    import time as time_module
+    import traceback
+    from datetime import datetime, timedelta
+    from google.cloud import bigquery
+
+    try:
+        ticker = request.args.get('ticker', 'GOOG')
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+
+        bq_client = bigquery.Client()
+        api_key = os.environ.get('TWELVEDATA_API_KEY')
+        if not api_key:
+            return jsonify({'error': 'TWELVEDATA_API_KEY not set'}), 500
+
+        # 1. Fetch all predictions for this ticker that don't yet have actuals
+        query = """
+            SELECT p.timestamp AS prediction_timestamp, p.last_price_time, p.last_price,
+                   p.pred_15m, p.pred_30m, p.pred_45m, p.pred_60m
+            FROM `trading-brains.tft_predictions.tft_predictions_logs` p
+            LEFT JOIN `trading-brains.tft_predictions.tft_actuals` a
+              ON p.timestamp = a.prediction_timestamp AND p.ticker = a.ticker
+            WHERE p.ticker = @ticker
+              AND a.prediction_timestamp IS NULL
+        """
+        params = [bigquery.ScalarQueryParameter("ticker", "STRING", ticker)]
+        if start_date:
+            query += " AND DATE(TIMESTAMP(p.timestamp)) >= @start_date"
+            params.append(bigquery.ScalarQueryParameter("start_date", "STRING", start_date))
+        if end_date:
+            query += " AND DATE(TIMESTAMP(p.timestamp)) <= @end_date"
+            params.append(bigquery.ScalarQueryParameter("end_date", "STRING", end_date))
+        query += " ORDER BY p.timestamp ASC"
+
+        job_cfg = bigquery.QueryJobConfig(query_parameters=params)
+        preds_df = bq_client.query(query, job_config=job_cfg).to_dataframe()
+
+        if preds_df.empty:
+            return jsonify({'status': 'no_predictions_needing_actuals', 'ticker': ticker})
+
+        preds_df['last_price_time_parsed'] = pd.to_datetime(preds_df['last_price_time'])
+        preds_df['date'] = preds_df['last_price_time_parsed'].dt.date
+        days = sorted(preds_df['date'].unique())
+
+        results = []
+        total_inserted = 0
+        total_skipped = 0
+        data_cache = {}
+
+        for day in days:
+            day_str = str(day)
+            day_preds = preds_df[preds_df['date'] == day]
+
+            # Fetch 1-min data for this day (with buffer for +60min lookahead)
+            if day_str not in data_cache:
+                try:
+                    fetch_start = (pd.Timestamp(day_str) - timedelta(days=1)).strftime('%Y-%m-%d')
+                    fetch_end = (pd.Timestamp(day_str) + timedelta(days=2)).strftime('%Y-%m-%d')
+
+                    url = "https://api.twelvedata.com/time_series"
+                    params_api = {
+                        'symbol': ticker,
+                        'interval': '1min',
+                        'outputsize': 5000,
+                        'start_date': fetch_start,
+                        'end_date': fetch_end,
+                        'apikey': api_key,
+                        'timezone': 'America/New_York',
+                    }
+                    response = requests.get(url, params=params_api, timeout=30)
+                    data = response.json()
+
+                    if 'values' not in data or not data['values']:
+                        total_skipped += len(day_preds)
+                        results.append({'day': day_str, 'error': 'No data from Twelve Data'})
+                        time_module.sleep(8)
+                        continue
+
+                    df = pd.DataFrame(data['values'])
+                    df['timestamp'] = pd.to_datetime(df['datetime'])
+                    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+                    df = df[['timestamp', 'close']].sort_values('timestamp').reset_index(drop=True)
+                    data_cache[day_str] = df
+                    time_module.sleep(8)
+                except Exception as e:
+                    total_skipped += len(day_preds)
+                    results.append({'day': day_str, 'error': f"{type(e).__name__}: {e}"})
+                    continue
+
+            df = data_cache[day_str]
+            actuals_batch = []
+            metrics_batch = []
+
+            for _, row in day_preds.iterrows():
+                base_time = row['last_price_time_parsed']
+                pred_ts = row['prediction_timestamp']
+                base_price = float(row['last_price'])
+
+                def get_actual(minutes_ahead):
+                    target = base_time + timedelta(minutes=minutes_ahead)
+                    diffs = abs(df['timestamp'] - target)
+                    if diffs.min() > timedelta(minutes=5):
+                        return None, None
+                    idx = diffs.idxmin()
+                    return str(df.loc[idx, 'timestamp']), float(df.loc[idx, 'close'])
+
+                a15_time, a15_price = get_actual(15)
+                a30_time, a30_price = get_actual(30)
+                a45_time, a45_price = get_actual(45)
+                a60_time, a60_price = get_actual(60)
+
+                if a60_price is None:
+                    total_skipped += 1
+                    continue
+
+                actual_row = {
+                    'prediction_timestamp': pred_ts,
+                    'ticker': ticker,
+                    'actual_15m_time': a15_time,
+                    'actual_15m_price': a15_price,
+                    'actual_30m_time': a30_time,
+                    'actual_30m_price': a30_price,
+                    'actual_45m_time': a45_time,
+                    'actual_45m_price': a45_price,
+                    'actual_60m_time': a60_time,
+                    'actual_60m_price': a60_price,
+                    'recorded_at': datetime.utcnow().isoformat()
+                }
+                actuals_batch.append(actual_row)
+
+                # Metrics
+                def _ae(p, a):
+                    return round(abs(p - a), 6) if a else None
+                def _pct(p, a):
+                    return round(abs(p - a) / a * 100, 4) if a and a != 0 else None
+                def _dir(p, a, b):
+                    return int((p - b) * (a - b) > 0) if (a and p != b and a != b) else None
+
+                metrics_batch.append({
+                    'prediction_timestamp': pred_ts,
+                    'ticker': ticker,
+                    'base_price': base_price,
+                    'ae_15m': _ae(float(row['pred_15m']), a15_price),
+                    'ae_30m': _ae(float(row['pred_30m']), a30_price),
+                    'ae_45m': _ae(float(row['pred_45m']), a45_price),
+                    'ae_60m': _ae(float(row['pred_60m']), a60_price),
+                    'pct_error_15m': _pct(float(row['pred_15m']), a15_price),
+                    'pct_error_30m': _pct(float(row['pred_30m']), a30_price),
+                    'pct_error_45m': _pct(float(row['pred_45m']), a45_price),
+                    'pct_error_60m': _pct(float(row['pred_60m']), a60_price),
+                    'direction_correct_15m': _dir(float(row['pred_15m']), a15_price, base_price),
+                    'direction_correct_30m': _dir(float(row['pred_30m']), a30_price, base_price),
+                    'direction_correct_45m': _dir(float(row['pred_45m']), a45_price, base_price),
+                    'direction_correct_60m': _dir(float(row['pred_60m']), a60_price, base_price),
+                    'pred_15m': float(row['pred_15m']),
+                    'pred_30m': float(row['pred_30m']),
+                    'pred_45m': float(row['pred_45m']),
+                    'pred_60m': float(row['pred_60m']),
+                    'actual_15m': a15_price,
+                    'actual_30m': a30_price,
+                    'actual_45m': a45_price,
+                    'actual_60m': a60_price,
+                    'recorded_at': datetime.utcnow().isoformat(),
+                })
+
+            # Batch insert
+            if actuals_batch:
+                err1 = bq_client.insert_rows_json("trading-brains.tft_predictions.tft_actuals", actuals_batch)
+                err2 = bq_client.insert_rows_json("trading-brains.tft_predictions.model_hourly_metrics", metrics_batch)
+                if err1 or err2:
+                    results.append({'day': day_str, 'error': str(err1 or err2)})
+                    total_skipped += len(actuals_batch)
+                else:
+                    total_inserted += len(actuals_batch)
+                    results.append({'day': day_str, 'inserted': len(actuals_batch)})
+
+        return jsonify({
+            'status': 'completed',
+            'ticker': ticker,
+            'total_predictions_without_actuals': len(preds_df),
+            'total_inserted': total_inserted,
+            'total_skipped': total_skipped,
+            'details': results,
+        })
+
+    except Exception as e:
+        import traceback
+        print(f"Backfill actuals error: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/backfill_historical', methods=['GET'])
+def backfill_historical():
+    """Generate historical predictions for dates where no predictions exist and insert into BigQuery."""
+    import numpy as np
+    import pandas as pd
+    import torch
+    import requests
+    import time as time_module
+    import traceback
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    from google.cloud import bigquery
+    from pytorch_forecasting import TimeSeriesDataSet
+
+    try:
+        ticker = request.args.get('ticker', 'GOOG')
+        start_date = request.args.get('start_date', '2026-03-19')
+        end_date = request.args.get('end_date', '2026-04-21')
+
+        model, dataset_params, device = get_model(ticker)
+        max_encoder_length = dataset_params.get('max_encoder_length', 60)
+        max_prediction_length = dataset_params.get('max_prediction_length', 60)
+        min_rows = max_encoder_length + max_prediction_length + 100
+
+        group_value = get_model_group(dataset_params)
+
+        bq_client = bigquery.Client()
+        api_key = os.environ.get('TWELVEDATA_API_KEY')
+        if not api_key:
+            return jsonify({'error': 'TWELVEDATA_API_KEY not set'}), 500
+
+        # Trading days in range
+        all_dates = pd.bdate_range(start=start_date, end=end_date)
+
+        # Prediction hours in ET (matching the hourly Cloud Scheduler pattern)
+        prediction_hours_et = [10, 11, 12, 13, 14, 15, 16]
+
+        results = []
+        total_inserted = 0
+        total_skipped = 0
+        data_cache = {}
+
+        for day in all_dates:
+            day_str = day.strftime('%Y-%m-%d')
+
+            if day_str not in data_cache:
+                try:
+                    fetch_start = (day - timedelta(days=5)).strftime('%Y-%m-%d')
+                    fetch_end = (day + timedelta(days=1)).strftime('%Y-%m-%d')
+
+                    url = "https://api.twelvedata.com/time_series"
+                    params = {
+                        'symbol': ticker,
+                        'interval': '1min',
+                        'outputsize': 5000,
+                        'start_date': fetch_start,
+                        'end_date': fetch_end,
+                        'apikey': api_key,
+                        'timezone': 'America/New_York',
+                    }
+                    response = requests.get(url, params=params, timeout=30)
+                    data = response.json()
+
+                    if 'values' not in data or not data['values']:
+                        total_skipped += len(prediction_hours_et)
+                        results.append({'day': day_str, 'error': 'No data from Twelve Data'})
+                        time_module.sleep(8)
+                        continue
+
+                    df = pd.DataFrame(data['values'])
+                    df['timestamp'] = pd.to_datetime(df['datetime'])
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                    df = df.sort_values('timestamp').reset_index(drop=True)
+
+                    df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
+                    df_feat = calculate_all_features(df)
+                    for col in ['target_close_60m', 'target_return_60m']:
+                        if col in df_feat.columns:
+                            df_feat[col] = df_feat[col].ffill().fillna(0)
+                    df_feat = df_feat.dropna().reset_index(drop=True)
+                    df_feat['group'] = group_value
+
+                    numeric_cols = df_feat.select_dtypes(include=[np.number]).columns.tolist()
+                    df_feat[numeric_cols] = df_feat[numeric_cols].replace([np.inf, -np.inf], np.nan)
+                    df_feat[numeric_cols] = df_feat[numeric_cols].ffill().bfill()
+
+                    data_cache[day_str] = df_feat
+                    time_module.sleep(8)
+                except Exception as e:
+                    total_skipped += len(prediction_hours_et)
+                    results.append({'day': day_str, 'error': f"{type(e).__name__}: {e}"})
+                    continue
+
+            df_feat = data_cache[day_str]
+            day_rows = []
+
+            for hour_et in prediction_hours_et:
+                pred_time_et = pd.Timestamp(f"{day_str} {hour_et:02d}:00:00")
+                pred_time_utc = pred_time_et.tz_localize('America/New_York').astimezone(ZoneInfo('UTC'))
+
+                mask = df_feat['timestamp'] <= pred_time_et
+                df_available = df_feat[mask]
+
+                if len(df_available) < min_rows:
+                    total_skipped += 1
+                    continue
+
+                df_window = df_available.iloc[-min_rows:].copy()
+                df_window['time_idx'] = range(len(df_window))
+
+                try:
+                    updated_params = update_normalizer_stats(dataset_params, df_window['close'])
+                    prediction_dataset = TimeSeriesDataSet.from_parameters(
+                        updated_params, df_window, predict=True,
+                    )
+                    pred_dataloader = prediction_dataset.to_dataloader(train=False, batch_size=1, num_workers=0)
+
+                    raw_pred = model.predict(pred_dataloader, mode="prediction")
+                    pred_array = raw_pred.squeeze().cpu().numpy()
+                    if len(pred_array.shape) == 2:
+                        pred_array = pred_array[:, pred_array.shape[1] // 2]
+
+                    last_close = float(df_window['close'].iloc[-(max_prediction_length + 1)])
+                    last_ts = df_window['timestamp'].iloc[-(max_prediction_length + 1)]
+
+                    row_data = {
+                        'timestamp': pred_time_utc.strftime('%Y-%m-%dT%H:%M:%S.%f'),
+                        'ticker': ticker,
+                        'last_price': float(last_close),
+                        'last_price_time': str(last_ts),
+                        'pred_15m': float(pred_array[14]),
+                        'pred_30m': float(pred_array[29]),
+                        'pred_45m': float(pred_array[44]),
+                        'pred_60m': float(pred_array[59]),
+                        'return_15m': float((pred_array[14] - last_close) / last_close * 100),
+                        'return_30m': float((pred_array[29] - last_close) / last_close * 100),
+                        'return_45m': float((pred_array[44] - last_close) / last_close * 100),
+                        'return_60m': float((pred_array[59] - last_close) / last_close * 100),
+                    }
+                    day_rows.append(row_data)
+
+                except Exception as e:
+                    total_skipped += 1
+                    results.append({'day': day_str, 'hour_et': hour_et, 'error': str(e)})
+
+            # Batch insert all predictions for this day
+            if day_rows:
+                table_id = "trading-brains.tft_predictions.tft_predictions_logs"
+                errors = bq_client.insert_rows_json(table_id, day_rows)
+                if errors:
+                    results.append({'day': day_str, 'error': str(errors)})
+                    total_skipped += len(day_rows)
+                else:
+                    total_inserted += len(day_rows)
+                    results.append({'day': day_str, 'inserted': len(day_rows),
+                                    'sample_pred_60m': day_rows[-1]['pred_60m'],
+                                    'sample_last_price': day_rows[-1]['last_price']})
+
+        return jsonify({
+            'status': 'completed',
+            'ticker': ticker,
+            'date_range': f"{start_date} to {end_date}",
+            'total_inserted': total_inserted,
+            'total_skipped': total_skipped,
+            'details': results,
+        })
+
+    except Exception as e:
+        import traceback
+        print(f"Backfill historical error: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
 if __name__ == '__main__':

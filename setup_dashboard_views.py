@@ -214,6 +214,151 @@ WHERE p.ticker IS NOT NULL
 """)
 
 
+# ============================================================
+# VIEW 6: Market status — open/closed indicator & countdown
+# Returns a single row with market state, next prediction time,
+# and human-readable countdown. Use as Looker Studio scorecards.
+# Predictions fire at :00 from 10am-4pm ET, Mon-Fri.
+# ============================================================
+create_view("vw_market_status", """
+WITH params AS (
+  SELECT
+    CURRENT_TIMESTAMP() AS utc_now,
+    TIMESTAMP(DATETIME(CURRENT_TIMESTAMP(), 'America/New_York')) AS et_ts,
+    EXTRACT(HOUR FROM DATETIME(CURRENT_TIMESTAMP(), 'America/New_York')) AS et_hour,
+    EXTRACT(MINUTE FROM DATETIME(CURRENT_TIMESTAMP(), 'America/New_York')) AS et_minute,
+    EXTRACT(DAYOFWEEK FROM DATETIME(CURRENT_TIMESTAMP(), 'America/New_York')) AS et_dow,
+    DATE(DATETIME(CURRENT_TIMESTAMP(), 'America/New_York')) AS et_date,
+    DATETIME(CURRENT_TIMESTAMP(), 'America/New_York') AS et_datetime
+),
+market_times AS (
+  SELECT *,
+    -- Market open: 9:30 ET, close: 4:00 ET
+    -- Predictions run 10:00-16:00 ET
+    CASE
+      WHEN et_dow IN (1, 7) THEN FALSE  -- Sunday=1, Saturday=7
+      WHEN et_hour < 9 THEN FALSE
+      WHEN et_hour = 9 AND et_minute < 30 THEN FALSE
+      WHEN et_hour >= 16 THEN FALSE
+      ELSE TRUE
+    END AS is_market_open,
+    CASE
+      WHEN et_dow IN (1, 7) THEN FALSE
+      WHEN et_hour < 10 THEN FALSE
+      WHEN et_hour >= 17 THEN FALSE
+      ELSE TRUE
+    END AS is_prediction_window,
+    -- Next prediction hour (predictions at :00 from 10-16)
+    CASE
+      WHEN et_dow IN (1, 7) THEN NULL  -- handled below
+      WHEN et_hour < 10 THEN 10
+      WHEN et_hour >= 16 THEN NULL     -- after last prediction
+      ELSE et_hour + 1                 -- next full hour
+    END AS next_pred_hour_today
+  FROM params
+),
+next_trading_day AS (
+  SELECT *,
+    CASE
+      WHEN et_dow = 7 THEN 2  -- Saturday → Monday (+2)
+      WHEN et_dow = 1 THEN 1  -- Sunday → Monday (+1)
+      WHEN et_dow = 6 THEN 3  -- Friday after hours → Monday (+3)
+      WHEN next_pred_hour_today IS NULL THEN
+        CASE WHEN et_dow = 6 THEN 3 ELSE 1 END  -- weekday after hours → next day (or Monday)
+      ELSE 0
+    END AS days_until_next
+  FROM market_times
+),
+result AS (
+  SELECT
+    utc_now,
+    et_datetime AS current_time_et,
+    is_market_open,
+    is_prediction_window,
+
+    -- Status label
+    CASE
+      WHEN is_market_open AND is_prediction_window THEN 'MARKET OPEN'
+      WHEN is_market_open AND NOT is_prediction_window THEN 'MARKET OPEN'
+      ELSE 'MARKET CLOSED'
+    END AS market_status,
+
+    -- Predictions status
+    CASE
+      WHEN is_prediction_window AND et_hour >= 10 AND et_hour <= 16 THEN 'PREDICTIONS LIVE'
+      ELSE 'PREDICTIONS PAUSED'
+    END AS prediction_status,
+
+    -- Status emoji/indicator
+    CASE
+      WHEN is_market_open THEN '🟢'
+      ELSE '🔴'
+    END AS status_indicator,
+
+    -- Next prediction timestamp (ET)
+    CASE
+      WHEN days_until_next = 0 AND next_pred_hour_today IS NOT NULL THEN
+        DATETIME(
+          TIMESTAMP(CONCAT(CAST(et_date AS STRING), ' ', LPAD(CAST(next_pred_hour_today AS STRING), 2, '0'), ':00:00')),
+          'America/New_York'
+        )
+      ELSE
+        DATETIME(
+          TIMESTAMP(CONCAT(CAST(DATE_ADD(et_date, INTERVAL days_until_next DAY) AS STRING), ' 10:00:00')),
+          'America/New_York'
+        )
+    END AS next_prediction_et,
+
+    -- Minutes until next prediction
+    CASE
+      WHEN days_until_next = 0 AND next_pred_hour_today IS NOT NULL THEN
+        (next_pred_hour_today * 60) - (et_hour * 60 + et_minute)
+      ELSE
+        TIMESTAMP_DIFF(
+          TIMESTAMP(CONCAT(CAST(DATE_ADD(et_date, INTERVAL days_until_next DAY) AS STRING), ' 10:00:00')),
+          TIMESTAMP(CONCAT(CAST(et_date AS STRING), ' ',
+            LPAD(CAST(et_hour AS STRING), 2, '0'), ':',
+            LPAD(CAST(et_minute AS STRING), 2, '0'), ':00')),
+          MINUTE
+        )
+    END AS minutes_until_next_prediction,
+
+    -- Human-readable countdown
+    CASE
+      WHEN is_prediction_window AND et_hour >= 10 AND et_hour <= 16 THEN
+        CONCAT('Next in ', CAST(60 - et_minute AS STRING), ' min')
+      WHEN days_until_next = 0 AND next_pred_hour_today IS NOT NULL THEN
+        CASE
+          WHEN (next_pred_hour_today * 60) - (et_hour * 60 + et_minute) < 60 THEN
+            CONCAT(CAST((next_pred_hour_today * 60) - (et_hour * 60 + et_minute) AS STRING), ' min')
+          ELSE
+            CONCAT(
+              CAST(DIV((next_pred_hour_today * 60) - (et_hour * 60 + et_minute), 60) AS STRING), 'h ',
+              CAST(MOD((next_pred_hour_today * 60) - (et_hour * 60 + et_minute), 60) AS STRING), 'm'
+            )
+        END
+      WHEN days_until_next = 1 THEN 'Tomorrow 10:00 AM ET'
+      WHEN days_until_next = 2 THEN 'Monday 10:00 AM ET'
+      WHEN days_until_next = 3 THEN 'Monday 10:00 AM ET'
+      ELSE CONCAT('In ', CAST(days_until_next AS STRING), ' days')
+    END AS countdown_text,
+
+    -- Last prediction time from actual data
+    (SELECT MAX(TIMESTAMP(timestamp))
+     FROM `trading-brains.tft_predictions.tft_predictions_logs`) AS last_prediction_time,
+
+    -- Total predictions today
+    (SELECT COUNT(*)
+     FROM `trading-brains.tft_predictions.tft_predictions_logs`
+     WHERE DATE(TIMESTAMP(timestamp)) = DATE(DATETIME(CURRENT_TIMESTAMP(), 'America/New_York'))
+    ) AS predictions_today
+
+  FROM next_trading_day
+)
+SELECT * FROM result
+""")
+
+
 print("\nAll views created successfully!")
 print("Connect Looker Studio to these views as data sources:")
 print("  1. vw_latest_predictions   → Scorecard / Table section")
@@ -221,3 +366,4 @@ print("  2. vw_prediction_history   → Prediction % change line chart")
 print("  3. vw_actual_vs_predicted  → Actual vs Predicted line charts")
 print("  4. vw_model_health         → Daily model health metrics")
 print("  5. vw_prediction_detail    → Per-prediction drill-down")
+print("  6. vw_market_status        → Market open/closed indicator & countdown")

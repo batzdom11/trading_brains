@@ -60,8 +60,11 @@ def log_eval_metrics_to_bq(
 
     # Get predictions
     predictions = best_tft.predict(val_dataloader, return_x=True)
-    # predictions.output is (batch, prediction_length, quantiles) – median is index 3 of 7 quantiles
-    pred_values = predictions.output[:, :, 3]  # median quantile
+    # predictions.output may be 3D (batch, prediction_length, quantiles) or 2D (batch, prediction_length)
+    if predictions.output.dim() == 3:
+        pred_values = predictions.output[:, :, 3]  # median quantile
+    else:
+        pred_values = predictions.output  # already median
     actuals = predictions.x["decoder_target"][:, :, 0] if predictions.x["decoder_target"].dim() == 3 else predictions.x["decoder_target"]
 
     pred_np = pred_values.detach().cpu().numpy().flatten()
@@ -110,8 +113,8 @@ def log_eval_metrics_to_bq(
     }
 
     # Insert into BigQuery (create table if needed)
-    bq_client = bigquery.Client()
-    table_id = f"{bq_client.project}.{BQ_DATASET}.{BQ_TABLE}"
+    bq_client = bigquery.Client(project="trading-brains")
+    table_id = f"trading-brains.{BQ_DATASET}.{BQ_TABLE}"
 
     schema = [
         bigquery.SchemaField("run_timestamp", "TIMESTAMP"),
@@ -152,8 +155,8 @@ def log_eval_metrics_to_bq(
         print(f"  Metrics logged to {table_id}")
 
 
-def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key: str) -> pd.DataFrame:
-    """Fetch 1-minute OHLCV data from Polygon.io with pagination."""
+def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key: str, max_retries: int = 5) -> pd.DataFrame:
+    """Fetch 1-minute OHLCV data from Polygon.io with pagination and retry."""
     import requests
 
     all_data = []
@@ -168,11 +171,34 @@ def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key
     print(f"Fetching {symbol} data from {start_date} to {end_date}...")
 
     while url:
-        response = requests.get(url, params=params, timeout=60)
-        data = response.json()
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.get(url, params=params, timeout=60)
+                data = response.json()
+            except (requests.RequestException, ValueError) as e:
+                print(f"  Request error (attempt {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    print(f"  Retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
+                raise ValueError(f"Failed to fetch data from Polygon for {symbol} after {max_retries} attempts")
+
+            if data.get("status") in ("OK", "DELAYED") and "results" in data:
+                break  # success
+
+            print(f"  API response: {data.get('status', 'unknown')} - {data.get('message', '')} (attempt {attempt}/{max_retries})")
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                print(f"  Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"  Giving up after {max_retries} attempts.")
+                break
+        else:
+            break  # max retries exhausted on request error
 
         if data.get("status") not in ("OK", "DELAYED") or "results" not in data:
-            print(f"API response: {data.get('status', 'unknown')} - {data.get('message', '')}")
             break
 
         all_data.extend(data["results"])
@@ -182,7 +208,7 @@ def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key
         if next_url:
             url = next_url
             params = {"apiKey": api_key}
-            time.sleep(0.5)  # Rate limit
+            time.sleep(1)  # Rate limit between pages
         else:
             url = None
 
@@ -219,7 +245,7 @@ def prepare_dataset(df: pd.DataFrame):
 
     # Add required columns
     df_feat["time_idx"] = range(len(df_feat))
-    df_feat["group"] = "SPY"
+    df_feat["group"] = "default"
 
     # Clean infinities
     numeric_cols = df_feat.select_dtypes(include=[np.number]).columns.tolist()
@@ -314,8 +340,8 @@ def train_model(args):
         predict=False,
     )
 
-    train_dataloader = training.to_dataloader(train=True, batch_size=args.batch_size, num_workers=0)
-    val_dataloader = validation.to_dataloader(train=False, batch_size=args.batch_size, num_workers=0)
+    train_dataloader = training.to_dataloader(train=True, batch_size=args.batch_size, num_workers=args.num_workers)
+    val_dataloader = validation.to_dataloader(train=False, batch_size=args.batch_size, num_workers=args.num_workers)
 
     # 5. Build model
     tft = TemporalFusionTransformer.from_dataset(
@@ -420,6 +446,7 @@ if __name__ == "__main__":
     parser.add_argument("--attention_head_size", type=int, default=2, help="TFT attention heads")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader num_workers")
     args = parser.parse_args()
 
     # Default GCS model path includes symbol for multi-ticker support
