@@ -78,6 +78,7 @@ def run_pipeline(args):
         "--hidden_size", str(args.hidden_size),
         "--attention_head_size", str(args.attention_head_size),
         "--dropout", str(args.dropout),
+        "--hidden_continuous_size", str(args.hidden_continuous_size),
         "--patience", str(args.patience),
     ]
 
@@ -112,7 +113,7 @@ def run_pipeline(args):
         args=train_args,
         replica_count=1,
         machine_type=machine_type,
-        sync=True,
+        sync=False,
     )
     if accelerator_type:
         run_kwargs["accelerator_type"] = accelerator_type
@@ -136,13 +137,14 @@ def main():
 
     # Training parameters
     parser.add_argument("--symbol", default="SPY")
-    parser.add_argument("--lookback_days", type=int, default=365)
-    parser.add_argument("--max_epochs", type=int, default=10)
+    parser.add_argument("--lookback_days", type=int, default=420)
+    parser.add_argument("--max_epochs", type=int, default=25)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=0.001)
-    parser.add_argument("--hidden_size", type=int, default=32)
-    parser.add_argument("--attention_head_size", type=int, default=2)
+    parser.add_argument("--hidden_size", type=int, default=64)
+    parser.add_argument("--attention_head_size", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--hidden_continuous_size", type=int, default=32)
     parser.add_argument("--patience", type=int, default=10)
 
     # Infrastructure

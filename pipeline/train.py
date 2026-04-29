@@ -29,7 +29,7 @@ import torch
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from pytorch_forecasting import TimeSeriesDataSet, GroupNormalizer, TemporalFusionTransformer
-from pytorch_forecasting.metrics import QuantileLoss
+from pytorch_forecasting.metrics import QuantileLoss, MultiHorizonMetric
 from google.cloud import bigquery, storage
 
 from features import calculate_all_features
@@ -37,6 +37,57 @@ from features import calculate_all_features
 
 BQ_DATASET = "tft_predictions"
 BQ_TABLE = "retraining_eval_logs"
+
+
+class DirectionAwareQuantileLoss(MultiHorizonMetric):
+    """
+    Composite loss: QuantileLoss + direction penalty.
+    Penalizes predictions where the predicted direction of change
+    disagrees with the actual direction of change.
+    """
+
+    def __init__(
+        self,
+        quantile_weight: float = 0.7,
+        direction_weight: float = 0.3,
+        quantiles: list = [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98],
+        **kwargs,
+    ):
+        super().__init__(quantiles=quantiles, **kwargs)
+        self.quantile_weight = quantile_weight
+        self.direction_weight = direction_weight
+        self.quantiles = quantiles
+
+    def loss(self, y_pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute composite loss.
+        y_pred: (batch, horizon, n_quantiles)
+        target: (batch, horizon)
+        """
+        # Quantile loss component
+        losses = []
+        for i, q in enumerate(self.quantiles):
+            errors = target - y_pred[..., i]
+            q_loss = torch.max((q - 1) * errors, q * errors)
+            losses.append(q_loss.unsqueeze(-1))
+        quantile_loss = torch.cat(losses, dim=-1).mean(dim=-1)  # (batch, horizon)
+
+        # Direction penalty: penalize when consecutive step directions disagree
+        median_idx = len(self.quantiles) // 2
+        pred_median = y_pred[..., median_idx]  # (batch, horizon)
+
+        pred_change = pred_median[:, 1:] - pred_median[:, :-1]
+        actual_change = target[:, 1:] - target[:, :-1]
+
+        # Soft direction penalty using tanh (differentiable sign approximation)
+        direction_agreement = torch.tanh(pred_change * 10) * torch.tanh(actual_change * 10)
+        direction_penalty = torch.clamp(1.0 - direction_agreement, min=0.0) / 2.0
+
+        # Pad first step (no direction info)
+        pad = torch.zeros_like(direction_penalty[:, :1])
+        direction_penalty = torch.cat([pad, direction_penalty], dim=1)  # (batch, horizon)
+
+        return self.quantile_weight * quantile_loss + self.direction_weight * direction_penalty
 
 
 def log_eval_metrics_to_bq(
@@ -226,6 +277,31 @@ def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key
     return df
 
 
+def remove_highly_correlated_features(df: pd.DataFrame, threshold: float = 0.95):
+    """Remove features with pairwise correlation > threshold."""
+    exclude_cols = [
+        "timestamp", "time_idx", "group",
+        "target_close_60m", "target_return_60m",
+        "open", "high", "low", "close", "volume", "vwap",
+    ]
+    feature_cols = [
+        c for c in df.columns
+        if c not in exclude_cols and df[c].dtype in ["float64", "float32", "int64"]
+    ]
+
+    df_clean = df[feature_cols].dropna()
+    corr_matrix = df_clean.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
+
+    print(f"Correlation filtering (threshold={threshold}):")
+    print(f"  Features before: {len(feature_cols)}")
+    print(f"  Features dropped: {len(to_drop)}")
+    print(f"  Features remaining: {len(feature_cols) - len(to_drop)}")
+
+    return df.drop(columns=to_drop), to_drop
+
+
 def prepare_dataset(df: pd.DataFrame):
     """Run feature engineering and prepare the TFT-ready DataFrame."""
     # Calculate VWAP
@@ -242,6 +318,9 @@ def prepare_dataset(df: pd.DataFrame):
     # Drop rows where target is NaN (last 60 rows won't have a label)
     df_feat = df_feat.dropna(subset=target_cols)
     df_feat = df_feat.reset_index(drop=True)
+
+    # Correlation filtering to remove redundant features
+    df_feat, dropped_cols = remove_highly_correlated_features(df_feat, threshold=0.95)
 
     # Add required columns
     df_feat["time_idx"] = range(len(df_feat))
@@ -350,10 +429,10 @@ def train_model(args):
         hidden_size=args.hidden_size,
         attention_head_size=args.attention_head_size,
         dropout=args.dropout,
-        hidden_continuous_size=16,
+        hidden_continuous_size=args.hidden_continuous_size,
         output_size=7,
-        loss=QuantileLoss(),
-        optimizer="adam",
+        loss=DirectionAwareQuantileLoss(quantile_weight=0.7, direction_weight=0.3),
+        reduce_on_plateau_patience=4,
     )
     print(f"\nModel parameters: {tft.size() / 1e3:.1f}k")
 
@@ -361,7 +440,7 @@ def train_model(args):
     checkpoint_dir = "/tmp/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    early_stop = EarlyStopping(monitor="val_loss", patience=args.patience, verbose=True, mode="min")
+    early_stop = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=args.patience, verbose=True, mode="min")
     lr_monitor = LearningRateMonitor(logging_interval="step")
     checkpoint_cb = ModelCheckpoint(
         dirpath=checkpoint_dir,
@@ -377,6 +456,7 @@ def train_model(args):
         callbacks=[early_stop, lr_monitor, checkpoint_cb],
         enable_model_summary=True,
         accelerator="auto",
+        gradient_clip_val=0.1,
     )
 
     print("\nStarting training...")
@@ -445,6 +525,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_size", type=int, default=32, help="TFT hidden size")
     parser.add_argument("--attention_head_size", type=int, default=2, help="TFT attention heads")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
+    parser.add_argument("--hidden_continuous_size", type=int, default=32, help="Hidden continuous size")
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader num_workers")
     args = parser.parse_args()
