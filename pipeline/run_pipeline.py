@@ -122,8 +122,11 @@ def run_pipeline(args):
 
     job.run(**run_kwargs)
 
-    print(f"\nTraining job completed: {display_name}")
-    print(f"Model uploaded to: gs://{GCS_BUCKET}/{GCS_MODEL_PATH}")
+    # Wait for job to be registered in Vertex AI before exiting
+    job.wait_for_resource_creation()
+    print(f"\nTraining job submitted: {display_name}")
+    print(f"Job resource name: {job.resource_name}")
+    print(f"Monitor at: https://console.cloud.google.com/vertex-ai/training/custom-jobs?project={PROJECT_ID}&region={REGION}")
 
 
 def main():
