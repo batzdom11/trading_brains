@@ -43,11 +43,12 @@ STAGING_BUCKET = f"gs://{GCS_BUCKET}"
 def build_container():
     """Build and push the training container image."""
     print("Building training container...")
+    pipeline_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
     cmd = [
         "gcloud", "builds", "submit",
         "--tag", IMAGE_URI,
         "--project", PROJECT_ID,
-        ".",
+        pipeline_dir,
     ]
     result = subprocess.run(cmd, check=True)
     if result.returncode != 0:
