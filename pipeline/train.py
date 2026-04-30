@@ -206,8 +206,12 @@ def log_eval_metrics_to_bq(
         print(f"  Metrics logged to {table_id}")
 
 
-def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key: str, max_retries: int = 5) -> pd.DataFrame:
-    """Fetch 1-minute OHLCV data from Polygon.io with pagination and retry."""
+def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key: str, max_retries: int = 10) -> pd.DataFrame:
+    """Fetch 1-minute OHLCV data from Polygon.io with pagination and retry.
+    
+    Uses aggressive backoff (base 3, up to 10 retries) and 15s pause between
+    paginated requests to stay within free-tier rate limits (5 calls/min).
+    """
     import requests
 
     all_data = []
@@ -229,7 +233,7 @@ def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key
             except (requests.RequestException, ValueError) as e:
                 print(f"  Request error (attempt {attempt}/{max_retries}): {e}")
                 if attempt < max_retries:
-                    wait = 2 ** attempt
+                    wait = min(3 ** attempt, 120)  # 3, 9, 27, 81, 120, 120...
                     print(f"  Retrying in {wait}s...")
                     time.sleep(wait)
                     continue
@@ -240,7 +244,7 @@ def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key
 
             print(f"  API response: {data.get('status', 'unknown')} - {data.get('message', '')} (attempt {attempt}/{max_retries})")
             if attempt < max_retries:
-                wait = 2 ** attempt
+                wait = min(3 ** attempt, 120)
                 print(f"  Retrying in {wait}s...")
                 time.sleep(wait)
             else:
@@ -259,7 +263,7 @@ def fetch_polygon_1min_data(symbol: str, start_date: str, end_date: str, api_key
         if next_url:
             url = next_url
             params = {"apiKey": api_key}
-            time.sleep(1)  # Rate limit between pages
+            time.sleep(15)  # 15s between pages to stay within free-tier rate limit
         else:
             url = None
 

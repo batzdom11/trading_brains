@@ -25,6 +25,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 # Clear stale GOOGLE_APPLICATION_CREDENTIALS if the file doesn't exist
@@ -135,6 +136,8 @@ def main():
     # Actions
     parser.add_argument("--build", action="store_true", help="Build and push the training container")
     parser.add_argument("--run", action="store_true", help="Submit a training job to Vertex AI")
+    parser.add_argument("--run_all", action="store_true", help="Submit training jobs for all 5 tickers with stagger delay")
+    parser.add_argument("--stagger_minutes", type=int, default=5, help="Minutes to wait between job submissions (for --run_all)")
 
     # API key (required for --run)
     parser.add_argument("--polygon_api_key", default=None, help="Polygon.io API key")
@@ -157,7 +160,7 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.build and not args.run:
+    if not args.build and not args.run and not args.run_all:
         parser.print_help()
         sys.exit(1)
 
@@ -173,6 +176,25 @@ def main():
                 print("ERROR: --polygon_api_key is required (or set POLYGON_API_KEY env var)")
                 sys.exit(1)
         run_pipeline(args)
+
+    if args.run_all:
+        if not args.polygon_api_key:
+            import os
+            args.polygon_api_key = os.environ.get("POLYGON_API_KEY")
+            if not args.polygon_api_key:
+                print("ERROR: --polygon_api_key is required (or set POLYGON_API_KEY env var)")
+                sys.exit(1)
+        tickers = ["SPY", "GOOG", "QQQ", "TSLA", "AAPL"]
+        for i, ticker in enumerate(tickers):
+            args.symbol = ticker
+            print(f"\n{'='*60}")
+            print(f"Submitting job {i+1}/{len(tickers)}: {ticker}")
+            print(f"{'='*60}")
+            run_pipeline(args)
+            if i < len(tickers) - 1:
+                wait = args.stagger_minutes * 60
+                print(f"\nWaiting {args.stagger_minutes} minutes before next submission...")
+                time.sleep(wait)
 
 
 if __name__ == "__main__":
