@@ -26,8 +26,8 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import torch
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from pytorch_forecasting import TimeSeriesDataSet, GroupNormalizer, TemporalFusionTransformer
 from pytorch_forecasting.metrics import QuantileLoss, MultiHorizonMetric
 from google.cloud import bigquery, storage
