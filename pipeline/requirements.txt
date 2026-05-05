@@ -11,3 +11,4 @@ requests==2.31.0
 torchmetrics>=1.0.0
 scipy
 scikit-learn
+scikit-base<0.14.0
