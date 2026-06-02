@@ -186,13 +186,13 @@ gcloud ai custom-jobs create ^
 --worker-pool-spec=machine-type=n1-standard-8,replica-count=1,container-image-uri=gcr.io/trading-brains/tft-training ^
 --args="--polygon_api_key=IYHqABfrpYN6yfa7bFS9LLNxwJzpn0YE,--gcs_bucket=tft-for-trading-brains,--symbol=SPY,--max_epochs=25,--lookback_days=425"
 
-### Retrain GOOG
+### Example: Retrain GOOG with extended batch sizes, more neurons and high memory machine
 gcloud ai custom-jobs create ^
 --region=europe-west6 ^
 --project=trading-brains ^
 --display-name=tft-retrain-GOOG ^
---worker-pool-spec=machine-type=n1-standard-8,replica-count=1,container-image-uri=gcr.io/trading-brains/tft-training ^
---args="--polygon_api_key=IYHqABfrpYN6yfa7bFS9LLNxwJzpn0YE,--gcs_bucket=tft-for-trading-brains,--symbol=GOOG,--max_epochs=25,--lookback_days=425"
+--worker-pool-spec=machine-type=n1-highmem-16,replica-count=1,container-image-uri=gcr.io/trading-brains/tft-training ^
+--args="--polygon_api_key=IYHqABfrpYN6yfa7bFS9LLNxwJzpn0YE,--gcs_bucket=tft-for-trading-brains,--symbol=GOOG,--max_epochs=15,--lookback_days=450,--batch_size=128,--hidden_size=64,--attention_head_size=4"
 
 The `--symbol` flag determines which ticker to fetch from Polygon and where to store
 the model (`tft_checkpoint_{SYMBOL}_latest.ckpt`). Cloud Run loads the per-ticker model
@@ -223,6 +223,21 @@ https://console.cloud.google.com/vertex-ai/training/custom-jobs?project=trading-
 Or via CLI:
 gcloud ai custom-jobs list --region=europe-west6 --project=trading-brains --limit=5
 
+### Start the cloud run services to log prediction data to Big Query
+##### Service to populate tft_predictions_logs for US-Market hours
+gcloud scheduler jobs create http tft-hourly-prediction-goog ^
+  --location=europe-west6 --project=trading-brains ^
+  --uri="https://tft-predictions-137489665103.europe-west6.run.app/predict?ticker=GOOG" ^
+  --http-method=POST --schedule="0 10-16 * * 1-5" ^
+  --time-zone=America/New_York --attempt-deadline=180s
+
+##### Service to populate tft_actuals
+gcloud scheduler jobs create http tft-record-actuals-btc ^
+  --location=europe-west6 --project=trading-brains ^
+  --uri="https://tft-predictions-137489665103.europe-west6.run.app/record_actuals?ticker=BTC" ^
+  --http-method=POST --schedule="5 11-17 * * 1-5" ^
+  --time-zone=America/New_York --attempt-deadline=180s
+
 
 ## Deploying the Serving Container
 
@@ -237,3 +252,18 @@ gcloud run deploy tft-predictions --image gcr.io/trading-brains/tft-predictions 
 
 - **Training**: Polygon.io REST API — 1-min OHLCV bars (free tier returns "DELAYED" status, which is fine for historical data)
 - **Inference**: Twelve Data API — 1-min OHLCV bars (real-time for predictions)
+
+
+## Building a Trading Architecture in Alpaca
+
+Cloud Scheduler (*/15 min)
+       │
+       ▼
+Cloud Run "tft-trader" service
+       │
+       ├── 1. Call /predict endpoint (or query BQ) → get signal
+       ├── 2. Apply strategy logic (entry/exit/sizing)
+       ├── 3. Place orders via Alpaca API
+       └── 4. Log trades to BigQuery
+
+See 'Architecture.md' inside the directory 'trading' for very detailed documentation

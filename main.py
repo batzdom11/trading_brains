@@ -19,13 +19,94 @@ if hasattr(torch.backends, 'cudnn'):
 
 from flask import Flask, jsonify, request
 
+# Required for loading checkpoints trained with custom loss
+from pytorch_forecasting.metrics import MultiHorizonMetric
+
+class DirectionAwareQuantileLoss(MultiHorizonMetric):
+    def __init__(self, quantile_weight=0.7, direction_weight=0.3,
+                 quantiles=[0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98], **kwargs):
+        super().__init__(quantiles=quantiles, **kwargs)
+        self.quantile_weight = quantile_weight
+        self.direction_weight = direction_weight
+        self.quantiles = quantiles
+
+    def loss(self, y_pred, target):
+        losses = []
+        for i, q in enumerate(self.quantiles):
+            errors = target - y_pred[..., i]
+            q_loss = torch.max((q - 1) * errors, q * errors)
+            losses.append(q_loss.unsqueeze(-1))
+        quantile_loss = torch.cat(losses, dim=-1).mean(dim=-1)
+        median_idx = len(self.quantiles) // 2
+        pred_median = y_pred[..., median_idx]
+        pred_change = pred_median[:, 1:] - pred_median[:, :-1]
+        actual_change = target[:, 1:] - target[:, :-1]
+        direction_agreement = torch.tanh(pred_change * 10) * torch.tanh(actual_change * 10)
+        direction_penalty = torch.clamp(1.0 - direction_agreement, min=0.0) / 2.0
+        pad = torch.zeros_like(direction_penalty[:, :1])
+        direction_penalty = torch.cat([pad, direction_penalty], dim=1)
+        return self.quantile_weight * quantile_loss + self.direction_weight * direction_penalty
+
+# Make DirectionAwareQuantileLoss findable when loading checkpoints pickled under __main__
+import sys
+if '__main__' in sys.modules:
+    sys.modules['__main__'].DirectionAwareQuantileLoss = DirectionAwareQuantileLoss
+else:
+    import types
+    fake_main = types.ModuleType('__main__')
+    fake_main.DirectionAwareQuantileLoss = DirectionAwareQuantileLoss
+    sys.modules['__main__'] = fake_main
+
 app = Flask(__name__)
 
 # Global variables for lazy loading
 GCS_BUCKET = "tft-for-trading-brains"
 
+# Mapping from model ticker (GCS filename) to Twelve Data symbol
+TICKER_TO_TWELVEDATA = {
+    'BTC': 'BTC/USD',
+    'ETH': 'ETH/USD',
+}
+
+def get_twelvedata_symbol(ticker):
+    """Convert model ticker to Twelve Data symbol format."""
+    return TICKER_TO_TWELVEDATA.get(ticker, ticker)
+
 # Per-ticker model cache: {ticker: (model, dataset_params, device)}
 _model_cache = {}
+
+def _ensure_predictions_schema():
+    """Add quantile/confidence columns to tft_predictions_logs if missing."""
+    from google.cloud import bigquery
+    client = bigquery.Client(project="trading-brains")
+    table_id = "trading-brains.tft_predictions.tft_predictions_logs"
+    try:
+        table = client.get_table(table_id)
+        existing_fields = {f.name for f in table.schema}
+        new_fields = [
+            ("q10_15m", "FLOAT64"), ("q90_15m", "FLOAT64"),
+            ("q10_30m", "FLOAT64"), ("q90_30m", "FLOAT64"),
+            ("q10_45m", "FLOAT64"), ("q90_45m", "FLOAT64"),
+            ("q10_60m", "FLOAT64"), ("q90_60m", "FLOAT64"),
+            ("confidence_15m", "FLOAT64"), ("confidence_30m", "FLOAT64"),
+            ("confidence_45m", "FLOAT64"), ("confidence_60m", "FLOAT64"),
+            ("uncertainty_15m", "FLOAT64"), ("uncertainty_30m", "FLOAT64"),
+            ("uncertainty_45m", "FLOAT64"), ("uncertainty_60m", "FLOAT64"),
+        ]
+        to_add = [(n, t) for n, t in new_fields if n not in existing_fields]
+        if to_add:
+            new_schema = list(table.schema) + [
+                bigquery.SchemaField(name, dtype) for name, dtype in to_add
+            ]
+            table.schema = new_schema
+            client.update_table(table, ["schema"])
+            print(f"Added {len(to_add)} columns to {table_id}: {[n for n,_ in to_add]}")
+        else:
+            print("Predictions table schema already up to date.")
+    except Exception as e:
+        print(f"Warning: Schema migration failed: {e}")
+
+_ensure_predictions_schema()
 
 @app.route('/')
 def health():
@@ -325,13 +406,17 @@ def download_market_data(ticker='SPY', days=7):
     for attempt in range(max_retries):
         try:
             # Twelve Data supports outputsize up to 5000 for 1-min data
-            outputsize = min(5000, days * 390)  # ~390 minutes per trading day
+            # Crypto trades 24/7 (~1440 min/day), stocks ~390 min/day
+            is_crypto = ticker in TICKER_TO_TWELVEDATA
+            minutes_per_day = 1440 if is_crypto else 390
+            outputsize = min(5000, days * minutes_per_day)
             
             print(f"Attempt {attempt + 1}: Downloading {ticker} data from Twelve Data...")
             
             url = "https://api.twelvedata.com/time_series"
+            twelvedata_symbol = get_twelvedata_symbol(ticker)
             params = {
-                'symbol': ticker,
+                'symbol': twelvedata_symbol,
                 'interval': '1min',
                 'outputsize': outputsize,
                 'apikey': api_key,
@@ -367,8 +452,14 @@ def download_market_data(ticker='SPY', days=7):
             })
             
             # Convert to numeric
-            for col in ['open', 'high', 'low', 'close', 'volume']:
+            for col in ['open', 'high', 'low', 'close']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # Volume may be missing for some crypto pairs
+            if 'volume' in df.columns:
+                df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+            else:
+                df['volume'] = 1.0
             
             df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
             df = df.sort_values('timestamp').reset_index(drop=True)
@@ -398,8 +489,11 @@ def get_predictions(ticker='SPY'):
     # 1. Download real-time data
     df = download_market_data(ticker, days=7)
     
-    # Calculate VWAP
-    df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
+    # Calculate VWAP (use typical price if volume is zero/missing)
+    if df['volume'].sum() > 0:
+        df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
+    else:
+        df['vwap'] = (df['high'] + df['low'] + df['close']) / 3
     
     # 2. Feature engineering
     df_features = calculate_all_features(df)
@@ -441,12 +535,43 @@ def get_predictions(ticker='SPY'):
     pred_array = raw_pred.squeeze().cpu().numpy()
     if len(pred_array.shape) == 2:
         pred_array = pred_array[:, pred_array.shape[1] // 2]
+
+    # Get full quantile output for confidence scoring
+    # Quantiles: [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]
+    raw_quantiles = model.predict(pred_dataloader, mode="quantiles")
+    q_array = raw_quantiles.squeeze().cpu().numpy()
+    # q_array shape: (60, 7) — 60 timesteps × 7 quantiles
+    # Indices: 0=q02, 1=q10, 2=q25, 3=q50, 4=q75, 5=q90, 6=q98
     
     # 5. Extract predictions at 15, 30, 45, 60 minutes
     # Last encoder position = end of lookback window (before prediction horizon)
     last_close = df_recent['close'].iloc[-(max_prediction_length + 1)]
     last_timestamp = df_recent['timestamp'].iloc[-(max_prediction_length + 1)]
-    
+
+    # Extract quantile bounds at each horizon
+    def _quantile_confidence(q_arr, timestep, base_price):
+        """Compute confidence from quantile spread.
+        Returns (q10, q90, confidence_score).
+        Confidence = how far the interval is from base_price relative to interval width.
+        Positive = bullish confidence, negative = bearish confidence.
+        """
+        q10 = float(q_arr[timestep, 1])   # 10th percentile
+        q90 = float(q_arr[timestep, 5])   # 90th percentile
+        interval_width = q90 - q10
+        if interval_width < 1e-8:
+            return q10, q90, 0.0
+        midpoint = (q10 + q90) / 2.0
+        # How far is base_price from the interval center, normalized by width
+        # Positive = model expects price above current (bullish)
+        # Negative = model expects price below current (bearish)
+        confidence = (midpoint - base_price) / interval_width
+        return q10, q90, float(confidence)
+
+    q10_15m, q90_15m, conf_15m = _quantile_confidence(q_array, 14, last_close)
+    q10_30m, q90_30m, conf_30m = _quantile_confidence(q_array, 29, last_close)
+    q10_45m, q90_45m, conf_45m = _quantile_confidence(q_array, 44, last_close)
+    q10_60m, q90_60m, conf_60m = _quantile_confidence(q_array, 59, last_close)
+
     predictions = {
         'timestamp': datetime.utcnow().isoformat(),
         'ticker': ticker,
@@ -460,9 +585,267 @@ def get_predictions(ticker='SPY'):
         'return_30m': float((pred_array[29] - last_close) / last_close * 100),
         'return_45m': float((pred_array[44] - last_close) / last_close * 100),
         'return_60m': float((pred_array[59] - last_close) / last_close * 100),
+        # Quantile bounds (10th and 90th percentile)
+        'q10_15m': q10_15m,
+        'q90_15m': q90_15m,
+        'q10_30m': q10_30m,
+        'q90_30m': q90_30m,
+        'q10_45m': q10_45m,
+        'q90_45m': q90_45m,
+        'q10_60m': q10_60m,
+        'q90_60m': q90_60m,
+        # Confidence scores: positive=bullish, negative=bearish, magnitude=strength
+        'confidence_15m': conf_15m,
+        'confidence_30m': conf_30m,
+        'confidence_45m': conf_45m,
+        'confidence_60m': conf_60m,
+        # Prediction interval width as % of price (model uncertainty)
+        'uncertainty_15m': float((q90_15m - q10_15m) / last_close * 100),
+        'uncertainty_30m': float((q90_30m - q10_30m) / last_close * 100),
+        'uncertainty_45m': float((q90_45m - q10_45m) / last_close * 100),
+        'uncertainty_60m': float((q90_60m - q10_60m) / last_close * 100),
     }
     
+    # 6. Extract TFT attention weights and feature importance
+    try:
+        interpretation = _extract_interpretation(model, pred_dataloader, ticker, predictions['timestamp'])
+        predictions['_interpretation'] = interpretation
+    except Exception as e:
+        print(f"Warning: Could not extract interpretation: {e}")
+    
+    # 7. Fetch VIX and compute volatility context
+    try:
+        vol_context = _fetch_volatility_context(ticker, df_recent)
+        predictions['_volatility_context'] = vol_context
+    except Exception as e:
+        print(f"Warning: Could not fetch volatility context: {e}")
+    
     return predictions
+
+
+def _extract_interpretation(model, pred_dataloader, ticker, prediction_timestamp):
+    """Extract TFT attention weights and variable importance from model output."""
+    import torch
+    import numpy as np
+
+    # Get a single batch from the dataloader
+    batch = next(iter(pred_dataloader))
+    x, y = batch
+
+    # Get raw model output (not the denormalized predictions)
+    with torch.no_grad():
+        raw_output = model(x)
+
+    # interpret_output gives us attention and variable importance
+    interpretation = model.interpret_output(raw_output, reduction="none")
+
+    result = {}
+
+    # Temporal attention weights: shape (batch, encoder_length)
+    if "attention" in interpretation:
+        attention = interpretation["attention"].squeeze().cpu().numpy()
+        # attention[i] = how much the model attended to encoder timestep i
+        result["temporal_attention"] = attention.tolist()
+
+    # Encoder variable importance: shape (batch, n_encoder_vars)
+    if "encoder_variables" in interpretation:
+        enc_imp = interpretation["encoder_variables"].mean(dim=0).cpu().numpy()
+        # Map indices to variable names
+        encoder_vars = model.encoder_variables
+        result["encoder_importance"] = {
+            name: float(enc_imp[i]) for i, name in enumerate(encoder_vars) if i < len(enc_imp)
+        }
+
+    # Decoder variable importance: shape (batch, n_decoder_vars)
+    if "decoder_variables" in interpretation:
+        dec_imp = interpretation["decoder_variables"].mean(dim=0).cpu().numpy()
+        decoder_vars = model.decoder_variables
+        result["decoder_importance"] = {
+            name: float(dec_imp[i]) for i, name in enumerate(decoder_vars) if i < len(dec_imp)
+        }
+
+    # Static variable importance (if any)
+    if "static_variables" in interpretation and interpretation["static_variables"].numel() > 0:
+        static_imp = interpretation["static_variables"].mean(dim=0).cpu().numpy()
+        static_vars = model.static_variables
+        result["static_importance"] = {
+            name: float(static_imp[i]) for i, name in enumerate(static_vars) if i < len(static_imp)
+        }
+
+    return result
+
+
+def _fetch_volatility_context(ticker, df_recent):
+    """Fetch VIX from TwelveData and compute asset-specific realized volatility."""
+    import requests
+    import numpy as np
+
+    api_key = os.environ.get('TWELVEDATA_API_KEY')
+    if not api_key:
+        return {}
+
+    result = {}
+
+    # Compute asset-specific realized volatility from recent data
+    close = df_recent['close'].values
+    returns = np.diff(close) / close[:-1]
+    result['realized_vol_30m'] = float(np.std(returns[-30:]) * np.sqrt(390)) if len(returns) >= 30 else None
+    result['realized_vol_1h'] = float(np.std(returns[-60:]) * np.sqrt(390)) if len(returns) >= 60 else None
+    result['realized_vol_4h'] = float(np.std(returns[-240:]) * np.sqrt(390)) if len(returns) >= 240 else None
+
+    # Classify volatility regime based on 1h realized vol
+    if result['realized_vol_1h'] is not None:
+        vol = result['realized_vol_1h']
+        if vol < 0.10:
+            result['vol_regime'] = 'low'
+        elif vol < 0.25:
+            result['vol_regime'] = 'medium'
+        else:
+            result['vol_regime'] = 'high'
+
+    # Fetch VIX quote from TwelveData
+    try:
+        url = "https://api.twelvedata.com/quote"
+        params = {'symbol': 'VIX', 'apikey': api_key}
+        resp = requests.get(url, params=params, timeout=10)
+        vix_data = resp.json()
+        if 'close' in vix_data:
+            result['vix_level'] = float(vix_data['close'])
+        elif 'previous_close' in vix_data:
+            result['vix_level'] = float(vix_data['previous_close'])
+    except Exception as e:
+        print(f"Warning: VIX fetch failed: {e}")
+
+    return result
+
+
+def _save_interpretation_to_bq(predictions):
+    """Save attention weights and feature importance to BigQuery."""
+    from google.cloud import bigquery
+    from datetime import datetime
+
+    interpretation = predictions.get('_interpretation')
+    vol_context = predictions.get('_volatility_context')
+    if not interpretation and not vol_context:
+        return
+
+    client = bigquery.Client(project="trading-brains")
+    prediction_ts = predictions['timestamp']
+    ticker = predictions['ticker']
+
+    # 1. Save feature importance
+    if interpretation and ('encoder_importance' in interpretation or 'decoder_importance' in interpretation):
+        table_id = "trading-brains.tft_predictions.feature_importance"
+        schema = [
+            bigquery.SchemaField("prediction_timestamp", "TIMESTAMP"),
+            bigquery.SchemaField("ticker", "STRING"),
+            bigquery.SchemaField("variable_name", "STRING"),
+            bigquery.SchemaField("variable_type", "STRING"),
+            bigquery.SchemaField("importance_score", "FLOAT64"),
+        ]
+        # Ensure table exists
+        try:
+            client.get_table(table_id)
+        except Exception:
+            table = bigquery.Table(table_id, schema=schema)
+            client.create_table(table)
+            print(f"Created BigQuery table: {table_id}")
+
+        rows = []
+        for var_name, score in interpretation.get('encoder_importance', {}).items():
+            rows.append({
+                'prediction_timestamp': prediction_ts,
+                'ticker': ticker,
+                'variable_name': var_name,
+                'variable_type': 'encoder',
+                'importance_score': round(score, 6),
+            })
+        for var_name, score in interpretation.get('decoder_importance', {}).items():
+            rows.append({
+                'prediction_timestamp': prediction_ts,
+                'ticker': ticker,
+                'variable_name': var_name,
+                'variable_type': 'decoder',
+                'importance_score': round(score, 6),
+            })
+        for var_name, score in interpretation.get('static_importance', {}).items():
+            rows.append({
+                'prediction_timestamp': prediction_ts,
+                'ticker': ticker,
+                'variable_name': var_name,
+                'variable_type': 'static',
+                'importance_score': round(score, 6),
+            })
+
+        if rows:
+            errors = client.insert_rows_json(table_id, rows)
+            if errors:
+                print(f"Feature importance BQ errors: {errors}")
+
+    # 2. Save temporal attention weights
+    if interpretation and 'temporal_attention' in interpretation:
+        table_id = "trading-brains.tft_predictions.temporal_attention"
+        schema = [
+            bigquery.SchemaField("prediction_timestamp", "TIMESTAMP"),
+            bigquery.SchemaField("ticker", "STRING"),
+            bigquery.SchemaField("timestep_offset", "INT64"),
+            bigquery.SchemaField("attention_weight", "FLOAT64"),
+        ]
+        try:
+            client.get_table(table_id)
+        except Exception:
+            table = bigquery.Table(table_id, schema=schema)
+            client.create_table(table)
+            print(f"Created BigQuery table: {table_id}")
+
+        attention = interpretation['temporal_attention']
+        encoder_length = len(attention)
+        rows = []
+        for i, weight in enumerate(attention):
+            rows.append({
+                'prediction_timestamp': prediction_ts,
+                'ticker': ticker,
+                'timestep_offset': i - encoder_length,  # -60 to -1
+                'attention_weight': round(float(weight), 6),
+            })
+
+        if rows:
+            errors = client.insert_rows_json(table_id, rows)
+            if errors:
+                print(f"Temporal attention BQ errors: {errors}")
+
+    # 3. Save volatility context
+    if vol_context:
+        table_id = "trading-brains.tft_predictions.volatility_context"
+        schema = [
+            bigquery.SchemaField("prediction_timestamp", "TIMESTAMP"),
+            bigquery.SchemaField("ticker", "STRING"),
+            bigquery.SchemaField("realized_vol_30m", "FLOAT64"),
+            bigquery.SchemaField("realized_vol_1h", "FLOAT64"),
+            bigquery.SchemaField("realized_vol_4h", "FLOAT64"),
+            bigquery.SchemaField("vix_level", "FLOAT64"),
+            bigquery.SchemaField("vol_regime", "STRING"),
+        ]
+        try:
+            client.get_table(table_id)
+        except Exception:
+            table = bigquery.Table(table_id, schema=schema)
+            client.create_table(table)
+            print(f"Created BigQuery table: {table_id}")
+
+        row = {
+            'prediction_timestamp': prediction_ts,
+            'ticker': ticker,
+            'realized_vol_30m': vol_context.get('realized_vol_30m'),
+            'realized_vol_1h': vol_context.get('realized_vol_1h'),
+            'realized_vol_4h': vol_context.get('realized_vol_4h'),
+            'vix_level': vol_context.get('vix_level'),
+            'vol_regime': vol_context.get('vol_regime'),
+        }
+        errors = client.insert_rows_json(table_id, [row])
+        if errors:
+            print(f"Volatility context BQ errors: {errors}")
+
 
 @app.route('/predict', methods=['GET', 'POST'])
 def predict():
@@ -472,7 +855,9 @@ def predict():
         ticker = request.args.get('ticker', 'SPY')
         predictions = get_predictions(ticker)
         save_to_bigquery(predictions)
-        return jsonify(predictions)
+        # Strip internal keys from API response
+        response = {k: v for k, v in predictions.items() if not k.startswith('_')}
+        return jsonify(response)
     except Exception as e:
         import traceback
         print(f"Error: {str(e)}")
@@ -483,11 +868,18 @@ def save_to_bigquery(predictions):
     """Save predictions to BigQuery for analysis"""
     from google.cloud import bigquery
     
+    # Save interpretation/volatility data to separate tables
+    try:
+        _save_interpretation_to_bq(predictions)
+    except Exception as e:
+        print(f"Warning: Failed to save interpretation to BQ: {e}")
+    
     client = bigquery.Client()
     table_id = "trading-brains.tft_predictions.tft_predictions_logs"
     
-    rows = [predictions]
-    errors = client.insert_rows_json(table_id, rows)
+    # Strip internal keys before saving to predictions table
+    row = {k: v for k, v in predictions.items() if not k.startswith('_')}
+    errors = client.insert_rows_json(table_id, [row])
     if errors:
         print(f"BigQuery errors: {errors}")
 

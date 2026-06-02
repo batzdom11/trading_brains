@@ -106,8 +106,8 @@ def log_eval_metrics_to_bq(
     """Compute evaluation metrics on validation set and log to BigQuery."""
     print("\nComputing evaluation metrics on validation set...")
 
-    # Load best model
-    best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+    # Load best model (strict=False needed for lightning 2.1.0 + pytorch-forecasting 1.6.1 compat)
+    best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path, strict=False)
 
     # Get predictions
     predictions = best_tft.predict(val_dataloader, return_x=True)
@@ -378,6 +378,15 @@ def train_model(args):
     # 2. Feature engineering
     df_tft = prepare_dataset(df)
 
+    # Save metadata before freeing memory
+    data_start = str(df["timestamp"].min())
+    data_end = str(df["timestamp"].max())
+
+    # Free raw data memory
+    del df
+    import gc
+    gc.collect()
+
     # 3. Build feature lists
     time_varying_known_reals, time_varying_unknown_reals = build_feature_lists(df_tft)
 
@@ -422,6 +431,14 @@ def train_model(args):
         df_tft[lambda x: x.time_idx > training_cutoff],
         predict=False,
     )
+
+    # Save row counts before freeing memory
+    training_rows = len(training)
+    validation_rows = len(validation)
+
+    # Free the raw DataFrame — TimeSeriesDataSet holds its own copy
+    del df_tft
+    gc.collect()
 
     train_dataloader = training.to_dataloader(train=True, batch_size=args.batch_size, num_workers=args.num_workers)
     val_dataloader = validation.to_dataloader(train=False, batch_size=args.batch_size, num_workers=args.num_workers)
@@ -496,10 +513,10 @@ def train_model(args):
         val_dataloader=val_dataloader,
         trainer=trainer,
         args=args,
-        data_start=str(df["timestamp"].min()),
-        data_end=str(df["timestamp"].max()),
-        training_rows=len(df_tft[df_tft["time_idx"] <= training_cutoff]),
-        validation_rows=len(df_tft[df_tft["time_idx"] > training_cutoff]),
+        data_start=data_start,
+        data_end=data_end,
+        training_rows=training_rows,
+        validation_rows=validation_rows,
         best_val_loss=best_val_loss,
         gcs_model_uri=f"gs://{args.gcs_bucket}/{args.gcs_model_path}",
     )
@@ -509,8 +526,8 @@ def train_model(args):
     print("Training complete!")
     print(f"  Epochs trained: {trainer.current_epoch + 1}")
     print(f"  Best val_loss:  {best_val_loss:.4f}")
-    print(f"  Data range:     {df['timestamp'].min()} to {df['timestamp'].max()}")
-    print(f"  Training rows:  {len(df_tft[df_tft['time_idx'] <= training_cutoff])}")
+    print(f"  Data range:     {data_start} to {data_end}")
+    print(f"  Training rows:  {training_rows}")
     print(f"  Model uploaded: gs://{args.gcs_bucket}/{args.gcs_model_path}")
     print(f"End time: {datetime.utcnow().isoformat()}")
     print("=" * 60)
@@ -531,7 +548,7 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("--hidden_continuous_size", type=int, default=32, help="Hidden continuous size")
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
-    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader num_workers")
+    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader num_workers (keep low to avoid memory duplication)")
     args = parser.parse_args()
 
     # Default GCS model path includes symbol for multi-ticker support

@@ -7,4 +7,4 @@ RUN pip install --upgrade pip && pip install --no-cache-dir --upgrade -r require
 
 COPY main.py .
 
-CMD ["python", "main.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "4", "--timeout", "300", "main:app"]

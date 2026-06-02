@@ -45,29 +45,50 @@ def build():
 
 def submit_job(ticker):
     """Submit a training job for a ticker."""
+    import json
+    import tempfile
+    
     print(f"\nSubmitting job for {ticker}...")
+    
+    # Write a config JSON to avoid gcloud --args comma parsing issues
+    config = {
+        "workerPoolSpecs": [{
+            "machineSpec": {
+                "machineType": "n1-highmem-8",
+            },
+            "replicaCount": 1,
+            "containerSpec": {
+                "imageUri": "gcr.io/trading-brains/tft-training",
+                "args": [
+                    "--polygon_api_key", "IYHqABfrpYN6yfa7bFS9LLNxwJzpn0YE",
+                    "--gcs_bucket", "tft-for-trading-brains",
+                    "--gcs_model_path", f"tft_checkpoint_{ticker}_latest.ckpt",
+                    "--symbol", ticker,
+                    "--lookback_days", "420",
+                    "--max_epochs", "25",
+                    "--batch_size", "128",
+                    "--learning_rate", "0.001",
+                    "--hidden_size", "64",
+                    "--attention_head_size", "4",
+                    "--dropout", "0.1",
+                    "--hidden_continuous_size", "32",
+                    "--patience", "10",
+                    "--num_workers", "4",
+                ],
+            },
+        }]
+    }
+    
+    config_path = os.path.join(tempfile.gettempdir(), f"tft_job_{ticker.lower()}.yaml")
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    
     rc = run([
         "ai", "custom-jobs", "create",
         "--project=trading-brains",
-        "--region=europe-west6",
+        "--region=europe-west4",
         f"--display-name=tft-training-{ticker.lower()}",
-        "--worker-pool-spec="
-        "machine-type=n1-standard-4,"
-        "replica-count=1,"
-        "container-image-uri=gcr.io/trading-brains/tft-training",
-        f"--args=--polygon_api_key,IYHqABfrpYN6yfa7bFS9LLNxwJzpn0YE,"
-        f"--gcs_bucket,tft-for-trading-brains,"
-        f"--gcs_model_path,tft_checkpoint_{ticker}_latest.ckpt,"
-        f"--symbol,{ticker},"
-        f"--lookback_days,420,"
-        f"--max_epochs,25,"
-        f"--batch_size,64,"
-        f"--learning_rate,0.001,"
-        f"--hidden_size,64,"
-        f"--attention_head_size,4,"
-        f"--dropout,0.1,"
-        f"--hidden_continuous_size,32,"
-        f"--patience,10",
+        f"--config={config_path}",
     ])
     return rc == 0
 
@@ -80,8 +101,13 @@ if __name__ == "__main__":
         build()
     
     if "--submit" in sys.argv or "--all" in sys.argv:
-        tickers = ["SPY", "GOOG", "QQQ", "TSLA", "AAPL"]
-        stagger = 300  # 5 minutes between jobs
+        default_tickers = ["SPY", "GOOG", "QQQ", "TSLA", "AAPL"]
+        # Allow --tickers SPY,QQQ,TSLA to override
+        tickers = default_tickers
+        for arg in sys.argv:
+            if arg.startswith("--tickers="):
+                tickers = arg.split("=")[1].split(",")
+        stagger = 60  # 1 minute between jobs (GPU jobs start fast)
         
         for i, ticker in enumerate(tickers):
             if i > 0:
@@ -93,7 +119,7 @@ if __name__ == "__main__":
         run([
             "ai", "custom-jobs", "list",
             "--project=trading-brains",
-            "--region=europe-west6",
+            "--region=europe-west4",
             "--sort-by=~createTime",
             "--limit=10",
             "--format=table(displayName,state,createTime)"

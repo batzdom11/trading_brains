@@ -71,7 +71,7 @@ def run_pipeline(args):
     train_args = [
         "--polygon_api_key", args.polygon_api_key,
         "--gcs_bucket", GCS_BUCKET,
-        "--gcs_model_path", GCS_MODEL_PATH,
+        "--gcs_model_path", f"tft_checkpoint_{args.symbol}_latest.ckpt",
         "--symbol", args.symbol,
         "--lookback_days", str(args.lookback_days),
         "--max_epochs", str(args.max_epochs),

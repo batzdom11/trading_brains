@@ -24,3 +24,7 @@ __pycache__/
 Thumbs.db
 
 Candelexport_NQ_24_RangeXV_08.08.2021_13.03.2026.xlsx
+cloud_functions/market_open_alert/get_token.py
+cloud_functions/market_open_alert/main.py
+cloud_functions/market_open_alert/oauth_client.json
+cloud_functions/market_open_alert/requirements.txt
