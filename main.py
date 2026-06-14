@@ -72,6 +72,13 @@ def get_twelvedata_symbol(ticker):
     """Convert model ticker to Twelve Data symbol format."""
     return TICKER_TO_TWELVEDATA.get(ticker, ticker)
 
+# Per-ticker return bias correction (additive, in fraction of price).
+# Measured as: mean_realized_return - mean_predicted_return.
+# Positive value shifts predictions upward (corrects bearish bias).
+TICKER_BIAS_CORRECTION = {
+    'BTC': 0.0031,  # model overshoots downside by ~0.31%
+}
+
 # Per-ticker model cache: {ticker: (model, dataset_params, device)}
 _model_cache = {}
 
@@ -546,6 +553,13 @@ def get_predictions(ticker='SPY'):
     # 5. Extract predictions at 15, 30, 45, 60 minutes
     # Last encoder position = end of lookback window (before prediction horizon)
     last_close = df_recent['close'].iloc[-(max_prediction_length + 1)]
+
+    # Apply per-ticker bias correction (shifts predictions to remove structural offset)
+    bias = TICKER_BIAS_CORRECTION.get(ticker, 0.0)
+    if bias != 0.0:
+        correction = bias * last_close
+        pred_array = pred_array + correction
+        q_array = q_array + correction
     last_timestamp = df_recent['timestamp'].iloc[-(max_prediction_length + 1)]
 
     # Extract quantile bounds at each horizon
