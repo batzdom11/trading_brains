@@ -1,0 +1,9 @@
+d_model: 64
+dropout: 0.1
+focal_alpha: 0.25
+focal_gamma: 2.0
+learning_rate: 0.0005
+n_features: 69
+nhead: 4
+num_layers: 2
+pos_weight: 1.0
