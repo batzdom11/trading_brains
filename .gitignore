@@ -28,3 +28,6 @@ cloud_functions/market_open_alert/get_token.py
 cloud_functions/market_open_alert/main.py
 cloud_functions/market_open_alert/oauth_client.json
 cloud_functions/market_open_alert/requirements.txt
+checkpoints/
+lightning_logs/
+models/
