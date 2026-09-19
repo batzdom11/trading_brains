@@ -31,3 +31,5 @@ cloud_functions/market_open_alert/requirements.txt
 checkpoints/
 lightning_logs/
 models/
+ckpt_pct/
+ckpt_tmp/
