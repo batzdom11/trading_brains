@@ -1,0 +1,27 @@
+script "Exchange Names (Matthias & Claude)"
+
+// Helper: lists every exchange that offers the chart's coin, with its
+// category (spot / futures / inverse ...). We need these exact names to make
+// the backtesters read AGGREGATED data (like MMT's "7 venues" overlays)
+// instead of only the chart's own exchange.
+
+data chart = subscribe(data.ohlcv, history: 10)
+
+window w = window(title: "Exchanges for this coin") {
+  tbl: table.new([
+    table.col(title: "#"),
+    table.col(title: "Exchange"),
+    table.col(title: "Category"),
+  ], title: "Exchanges", capacity: 100),
+}
+
+on chart.close {
+  let names = markets.exchangesForSymbol(context.symbol)
+  let k = 0.0
+  for nm in names {
+    let id = str.format("{0:.0}", k + 1.0)
+    w.tbl.row(id, id, nm, markets.exchangeCategory(nm))
+    k = k + 1.0
+  }
+  w.tbl.row("00", "", context.symbol, context.exchange)
+}

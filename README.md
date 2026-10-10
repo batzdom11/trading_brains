@@ -1,4 +1,25 @@
-# Trading Brains — TFT Price Prediction
+# Trading Brains
+
+## Folder structure
+
+| Folder / file | What it is | Owner |
+|---|---|---|
+| `main.py`, `Dockerfile`, `requirements.txt`, `.gcloudignore` | Cloud Run prediction service (`tft-predictions`) | Dominik |
+| `pipeline/`, `build_and_submit.py` | Vertex AI training container and job submission | Dominik |
+| `trading/` | Paper-trading service (Alpaca) and its architecture doc | Dominik |
+| `cloud_functions/` | Scheduled cloud functions | Dominik |
+| `trading_brains_main_tft/` | The main Trading Brains TFT model: development notebooks, local checkpoints (`models/`, `checkpoints/`), training logs, SPY data | Dominik |
+| `side_experiments_and_research/` | Side experiments, separate from the main model: BTC/MMT order flow, SPY vs BTC control, MMT backtest scripts | Matthias & Claude |
+| `docs/` | Shared project status and the ML-for-trading literature review | all |
+
+Deployment paths are unchanged: everything Cloud Run, Vertex AI and the cloud
+functions build from still sits where it was. Notebooks in `trading_brains_main_tft/` expect to be
+run with `trading_brains_main_tft/` as the working directory (the default in VS Code / Jupyter),
+so their relative paths `models/…` and `checkpoints/…` keep working.
+
+---
+
+## TFT Price Prediction
 
 Hourly stock/ETF price predictions using a Temporal Fusion Transformer (TFT),
 served via Cloud Run and retrained on Vertex AI. Each ticker (e.g. SPY, GOOG)

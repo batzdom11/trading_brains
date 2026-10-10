@@ -1,0 +1,594 @@
+script "Multi-Venue Aggression v6 (Matthias & Claude)"
+
+// Basic version of: heavy volume -> level -> price proves it by moving away ->
+// price comes back to test it -> trade away from the level.
+//   1. Heavy-volume bar (volume > k x average) defines a zone = its high..low.
+//   2. Proof: a close at least `awayBps` beyond the zone. Above = support
+//      (long setup), below = resistance (short setup).
+//   3. Retest: price returns into the zone -> limit entry at the zone edge.
+//   4. Stop beyond the far side of the zone (with a minimum distance),
+//      target = tpR x stop distance, max holding time.
+// Conservative fills: on the entry bar only the stop can trigger; later bars
+// check the stop before the target.
+//
+// v3: BENCHMARK. Two signal-free books run alongside: one goes long, one goes
+// short, at regular intervals, with the same stop size, target multiple and
+// holding time. If benchmark longs earn as much as our longs, the signal adds
+// nothing and the result is just market drift.
+// v3 also fixes the v2 compile error (all counters and thresholds are floats).
+//
+// v6: MULTI-VENUE AGGRESSION TRIGGER (a 1-minute stand-in for Michael's
+//   Speed of Waves: spot + futures + inverse firing together).
+//   A zone forms on a bar where the volume delta spikes in the SAME
+//   direction on several venues at once. Spike = |delta| > aggMult x that
+//   venue's running average |delta| (EMA over `volLen` bars).
+//   Venues (symbol = the chart's coin): Binance spot, Binance perps,
+//   Deribit inverse. Change the exchange ids in the three `subscribe` lines
+//   if needed; row "Venue feeds" shows whether each one delivers data.
+//   Continuation (Michael's read): with "same direction" on, a zone from
+//   BUY aggression only counts as proven if price then closes ABOVE it
+//   (long on the retest), SELL aggression only below it (short).
+//   Trigger mode 1 = the old single-chart heavy-volume zones, for comparison.
+//   Everything after the zone (proof, retest, exits, fees, benchmark,
+//   halves, R/$) is identical to Volume Backtester v4.3.
+//
+// v4.3: EXECUTION & EXITS.
+//   - Fees by order type: limit entry/target = maker, stop/timeout/proof
+//     entry = taker + slippage (replaces the flat round-trip cost).
+//   - Limit fills: price must trade THROUGH the limit by `fillThruBps`
+//     (a touch alone may not fill). Zones touched but never filled are
+//     counted as missed trades.
+//   - Target in R or in fixed bps (e.g. 100 = Michael's 1%).
+//   - Optional TP1 (partial exit, then stop to entry) and optional
+//     "stop to entry after x R". Stop moves apply from the NEXT bar.
+//   - The benchmark keeps plain stop/target exits (no TP1 / breakeven).
+// v4.2: trades per day/week, results in R and in $ for a chosen account and
+// risk per trade (1R = the stop distance of that trade).
+// v4.1: chart timeframe and the half-split are automatic; rows show n/a
+// instead of misleading zeros when there are no trades.
+//
+// v4: CVD DIVERGENCE TAG (Michael's confirmation). Every trade is tagged at
+// entry and reported in two groups, so one run shows whether the divergence
+// adds anything. Definition: price is back at the zone, but CVD has moved
+// against the trade since the heavy-volume bar (long: CVD now LOWER than at
+// the zone bar = sellers hit it and could not break it = absorption; short:
+// CVD now HIGHER). CVD is read at the close BEFORE the entry bar, so the tag
+// uses no information from after the fill. Meant for entry mode 0 (retest).
+
+data chart = subscribe(data.ohlcv, history: 20000)
+data vd = subscribe(data.vd, history: 20000)
+data vdS = subscribe(data.vd, exchange: "binance", history: 20000)
+data vdF = subscribe(data.vd, exchange: "binancef", history: 20000)
+data vdI = subscribe(data.vd, exchange: "deribit", history: 20000)
+
+input (
+  volLen     = input.int(60, title: "Volume Avg Length (bars)", min: 5, max: 500)
+  trigMode   = input.int(0, title: "Zone trigger: 0 = multi-venue aggression, 1 = heavy volume", min: 0, max: 1)
+  aggMult    = input.float(3.0, title: "Aggression spike (x venue avg |delta|)", min: 1.0, max: 50.0)
+  minVenues  = input.int(3, title: "Venues that must fire together (2-3)", min: 2, max: 3)
+  sameDir    = input.int(1, title: "Continuation only: proof in aggression direction (1 = yes)", min: 0, max: 1)
+  volMult    = input.float(4.0, title: "Heavy volume (x avg), trigger mode 1", min: 1.0, max: 50.0)
+  awayBps    = input.float(30.0, title: "Proof: move away (bps)", min: 0.0, max: 500.0)
+  entryMode  = input.int(0, title: "Entry: 0 = on retest, 1 = on proof", min: 0, max: 1)
+  expireHrs  = input.float(4.0, title: "Zone expiry (hours)", min: 0.1, max: 168.0)
+  bufferBps  = input.float(5.0, title: "Stop buffer beyond zone (bps)", min: 0.0, max: 200.0)
+  minSlBps   = input.float(25.0, title: "Min stop distance (bps)", min: 1.0, max: 500.0)
+  tpMode     = input.int(0, title: "Target: 0 = x stop (R), 1 = fixed bps", min: 0, max: 1)
+  tpR        = input.float(1.5, title: "Target (x stop distance)", min: 0.2, max: 20.0)
+  tpBps      = input.float(100.0, title: "Target (bps) if fixed", min: 1.0, max: 2000.0)
+  tp1R       = input.float(0.0, title: "TP1 at (x stop), 0 = off", min: 0.0, max: 20.0)
+  tp1Frac    = input.float(0.5, title: "TP1 size (fraction of position)", min: 0.05, max: 1.0)
+  beR        = input.float(0.0, title: "Stop to entry after (x stop), 0 = off", min: 0.0, max: 20.0)
+  maxHrs     = input.float(4.0, title: "Max time in trade (hours)", min: 0.1, max: 168.0)
+  makerBps   = input.float(2.0, title: "Fee maker, per side (bps)", min: 0.0, max: 50.0)
+  takerBps   = input.float(5.5, title: "Fee taker, per side (bps)", min: 0.0, max: 50.0)
+  slipBps    = input.float(1.0, title: "Slippage on market orders (bps)", min: 0.0, max: 50.0)
+  fillThruBps = input.float(1.0, title: "Limit fill: trade-through needed (bps)", min: 0.0, max: 50.0)
+  benchHrs   = input.float(1.0, title: "Benchmark: new entry every (hours)", min: 0.1, max: 168.0)
+  benchSlBps = input.float(0.0, title: "Benchmark stop (bps, 0 = strategy avg)", min: 0.0, max: 500.0)
+  cvdMode    = input.int(0, title: "CVD div: 0 = tag only, 1 = only div, 2 = only no-div", min: 0, max: 2)
+  acctUsd    = input.float(100000.0, title: "Account size ($)", min: 1000.0, max: 10000000.0)
+  riskPct    = input.float(0.5, title: "Risk per trade (% of account)", min: 0.05, max: 5.0)
+)
+
+pane eqPane = pane(title: "Cumulative PnL (bps): net, gross in grey", height: 0.25)
+
+plot (
+  equity  = plot.line(title: "Cum Net PnL (bps)", on: eqPane, width: 2)
+  grossEq = plot.line(title: "Cum Gross PnL (bps)", on: eqPane, color: color.gray, width: 1)
+  longIn  = plot.marker(title: "Long entry", shape: shape.up, color: color.green, size: 10)
+  shortIn = plot.marker(title: "Short entry", shape: shape.down, color: color.red, size: 10)
+  divMark = plot.marker(title: "CVD divergence at entry", shape: shape.circle, color: color.yellow, size: 6)
+)
+
+window results = window(title: "Multi-Venue Aggression v6") {
+  tbl: table.new([
+    table.col(title: "Metric"),
+    table.col(title: "Value", align: align.right),
+  ], title: "Results", capacity: 44),
+}
+
+state (
+  arrows = entities.arrowPool(max: 1000)
+  boxes = entities.boxPool(max: 1000)
+  aSlot: int = 0
+  bSlot: int = 0
+
+  // zone: 0 = none, 1 = waiting for proof, 2 = proven support, 3 = proven resistance
+  zState: int = 0
+  zHi: float = 0.0
+  zLo: float = 0.0
+  zT = time.fromUnixSeconds(0)
+  zAge: float = 0.0
+
+  // open strategy trade
+  dir: float = 0.0
+  entry: float = 0.0
+  stopPx: float = 0.0
+  tgtPx: float = 0.0
+  held: float = 0.0
+  entryT = time.fromUnixSeconds(0)
+
+  // strategy statistics
+  zonesMade: float = 0.0
+  zonesProven: float = 0.0
+  entries: float = 0.0
+  slSum: float = 0.0
+  trades: float = 0.0
+  wins: float = 0.0
+  targets: float = 0.0
+  stops: float = 0.0
+  timeouts: float = 0.0
+  longs: float = 0.0
+  longGross: float = 0.0
+  shorts: float = 0.0
+  shortGross: float = 0.0
+  cum: float = 0.0
+  cumGross: float = 0.0
+  peak: float = 0.0
+  maxDd: float = 0.0
+  barNo: float = 0.0
+  firstPx: float = 0.0
+  // snapshots of the running totals every 100 bars -> automatic halves
+  snapN = float[](1000)
+  snapG = float[](1000)
+  snapE = float[](1000)
+  blk: int = 0
+  midIdx: int = 0
+  flip: int = 0
+
+  // benchmark long book
+  blOpen: float = 0.0
+  blEntry: float = 0.0
+  blStop: float = 0.0
+  blTgt: float = 0.0
+  blHeld: float = 0.0
+  blLast: float = -1000000.0
+  blN: float = 0.0
+  blGross: float = 0.0
+
+  // benchmark short book
+  bsOpen: float = 0.0
+  bsEntry: float = 0.0
+  bsStop: float = 0.0
+  bsTgt: float = 0.0
+  bsHeld: float = 0.0
+  bsLast: float = -1000000.0
+  bsN: float = 0.0
+  bsGross: float = 0.0
+
+  // CVD and divergence tag
+  cvd: float = 0.0
+  zCvd: float = 0.0
+
+  // multi-venue aggression
+  emaS: float = 0.0
+  emaF: float = 0.0
+  emaI: float = 0.0
+  seenS: float = 0.0
+  seenF: float = 0.0
+  seenI: float = 0.0
+  zDir: float = 0.0
+  trigUp: float = 0.0
+  trigDn: float = 0.0
+
+  // execution / exits
+  zTouched: float = 0.0
+  missed: float = 0.0
+  entryFee: float = 0.0
+  tp1Px: float = 0.0
+  beTrig: float = 0.0
+  rem: float = 1.0
+  realized: float = 0.0
+  tp1Fees: float = 0.0
+  tp1Done: float = 0.0
+  movedBe: float = 0.0
+  tp1Count: float = 0.0
+  beExits: float = 0.0
+  tradeDiv: float = 0.0
+  dvN: float = 0.0
+  dvGross: float = 0.0
+  dvNet: float = 0.0
+  ndN: float = 0.0
+  ndGross: float = 0.0
+  ndNet: float = 0.0
+
+  // R view (1R = stop distance of the trade)
+  tradeSlBps: float = 0.0
+  cumR: float = 0.0
+  peakR: float = 0.0
+  maxDdR: float = 0.0
+)
+
+on chart.close {
+  // Series functions are called on every bar, before any branching.
+  let avgVol = ta.sma(chart.volume, volLen)
+
+  let t = chart.time ?? time.fromUnixSeconds(0)
+  let hi = chart.high ?? 0.0
+  let lo = chart.low ?? 0.0
+  let px = chart.close ?? 0.0
+  let vol = chart.volume ?? 0.0
+  let gap: float? = null
+  let wasFlat = dir == 0.0
+  let tfMin = math.round(time.tfSeconds(context.timeframe)) / 60.0
+  let expireBars = expireHrs * 60.0 / tfMin
+  let maxBars = maxHrs * 60.0 / tfMin
+  let everyBars = benchHrs * 60.0 / tfMin
+  barNo = barNo + 1.0
+  firstPx = firstPx > 0.0 ? firstPx : px
+
+  // 1. Zone lifecycle: age, expiry, proof.
+  // CVD: cumulative volume delta of this chart's exchange. cvdBefore = value at
+  // the previous close (what was known before this bar traded).
+  let cvdBefore = cvd
+  cvd = cvd + (vd.close ?? 0.0)
+
+  let justProven = false
+  if zState != 0 {
+    zAge = zAge + 1.0
+    if zAge > expireBars {
+      missed = (zTouched > 0.5 && zState >= 2) ? missed + 1.0 : missed
+      zTouched = 0.0
+      zState = 0
+    }
+  }
+  if zState == 1 {
+    if px >= zHi * (1.0 + awayBps / 10000.0) && (sameDir == 0 || trigMode == 1 || zDir > 0.0) {
+      zState = 2
+      zonesProven = zonesProven + 1.0
+      justProven = true
+    } else if px <= zLo * (1.0 - awayBps / 10000.0) && (sameDir == 0 || trigMode == 1 || zDir < 0.0) {
+      zState = 3
+      zonesProven = zonesProven + 1.0
+      justProven = true
+    }
+  }
+
+  // 2. Entry (only when flat).
+  //    Mode 0: limit order at the zone edge on the retest (never on the proof bar).
+  //    Mode 1: enter at the close of the proof bar, no retest needed.
+  let thru = fillThruBps / 10000.0
+  let touchLong = entryMode == 0 && !justProven && zState == 2 && lo <= zHi
+  let touchShort = entryMode == 0 && !justProven && zState == 3 && hi >= zLo
+  let retestLong = touchLong && lo <= zHi * (1.0 - thru)
+  let retestShort = touchShort && hi >= zLo * (1.0 + thru)
+  let proofLong = entryMode == 1 && justProven && zState == 2
+  let proofShort = entryMode == 1 && justProven && zState == 3
+  let divLong = cvdBefore < zCvd
+  let divShort = cvdBefore > zCvd
+  let okLong = cvdMode == 0 || (cvdMode == 1 && divLong) || (cvdMode == 2 && !divLong)
+  let okShort = cvdMode == 0 || (cvdMode == 1 && divShort) || (cvdMode == 2 && !divShort)
+  let longSetup = wasFlat && (retestLong || proofLong) && okLong
+  let touchOnly = wasFlat && ((okLong && touchLong && !retestLong) || (okShort && touchShort && !retestShort))
+  if touchOnly {
+    zTouched = 1.0
+  }
+  let shortSetup = wasFlat && (retestShort || proofShort) && okShort
+  if longSetup || shortSetup {
+    let d = longSetup ? 1.0 : -1.0
+    let edge = longSetup ? zHi : zLo
+    let far = longSetup ? zLo : zHi
+    let fillPx = entryMode == 1 ? px : edge
+    let slDist = math.max(math.abs(fillPx - far) + fillPx * bufferBps / 10000.0, fillPx * minSlBps / 10000.0)
+    dir = d
+    entry = fillPx
+    stopPx = fillPx - d * slDist
+    let tgtDist = tpMode == 1 ? fillPx * tpBps / 10000.0 : tpR * slDist
+    tgtPx = fillPx + d * tgtDist
+    tp1Px = fillPx + d * tp1R * slDist
+    beTrig = fillPx + d * beR * slDist
+    rem = 1.0
+    realized = 0.0
+    tp1Fees = 0.0
+    tp1Done = 0.0
+    movedBe = 0.0
+    entryFee = entryMode == 1 ? takerBps + slipBps : makerBps
+    zTouched = 0.0
+    held = 0.0
+    entryT = t
+    entries = entries + 1.0
+    tradeDiv = (longSetup ? divLong : divShort) ? 1.0 : 0.0
+    slSum = slSum + slDist / fillPx * 10000.0
+    tradeSlBps = slDist / fillPx * 10000.0
+    zState = 0
+  }
+  let enteredNow = wasFlat && dir != 0.0
+
+  // 3. Manage the open trade. On a limit-fill bar only the stop may trigger.
+  if dir != 0.0 {
+    if !enteredNow {
+      held = held + 1.0
+    }
+    let hitStop = dir > 0.0 ? lo <= stopPx : hi >= stopPx
+    let canTp1 = !enteredNow && !hitStop && tp1R > 0.0 && tp1Done < 0.5
+    let hitTp1 = canTp1 && (dir > 0.0 ? hi >= tp1Px : lo <= tp1Px)
+    if hitTp1 {
+      realized = realized + tp1Frac * (tp1Px - entry) / entry * 10000.0 * dir
+      tp1Fees = tp1Frac * makerBps
+      rem = 1.0 - tp1Frac
+      tp1Done = 1.0
+      tp1Count = tp1Count + 1.0
+    }
+    let hitTgt = !enteredNow && !hitStop && (dir > 0.0 ? hi >= tgtPx : lo <= tgtPx)
+    if hitStop || hitTgt || held >= maxBars {
+      let exitPx = hitStop ? stopPx : (hitTgt ? tgtPx : px)
+      let gross = realized + rem * (exitPx - entry) / entry * 10000.0 * dir
+      let exitFee = hitTgt ? makerBps : takerBps + slipBps
+      let pnl = gross - (entryFee + tp1Fees + rem * exitFee)
+      beExits = (hitStop && movedBe > 0.5) ? beExits + 1.0 : beExits
+      cumR = cumR + pnl / tradeSlBps
+      peakR = math.max(peakR, cumR)
+      maxDdR = math.max(maxDdR, peakR - cumR)
+      cum = cum + pnl
+      cumGross = cumGross + gross
+      trades = trades + 1.0
+      wins = pnl > 0.0 ? wins + 1.0 : wins
+      stops = hitStop ? stops + 1.0 : stops
+      targets = (!hitStop && hitTgt) ? targets + 1.0 : targets
+      timeouts = (!hitStop && !hitTgt) ? timeouts + 1.0 : timeouts
+      longs = dir > 0.0 ? longs + 1.0 : longs
+      longGross = dir > 0.0 ? longGross + gross : longGross
+      shorts = dir < 0.0 ? shorts + 1.0 : shorts
+      shortGross = dir < 0.0 ? shortGross + gross : shortGross
+      peak = math.max(peak, cum)
+      maxDd = math.max(maxDd, peak - cum)
+      let wasDiv = tradeDiv > 0.5
+      dvN = wasDiv ? dvN + 1.0 : dvN
+      dvGross = wasDiv ? dvGross + gross : dvGross
+      dvNet = wasDiv ? dvNet + pnl : dvNet
+      ndN = wasDiv ? ndN : ndN + 1.0
+      ndGross = wasDiv ? ndGross : ndGross + gross
+      ndNet = wasDiv ? ndNet : ndNet + pnl
+
+      // One arrow per trade: entry -> exit, green if net profit, red if not.
+      aSlot = aSlot >= 999 ? 0 : aSlot + 1
+      arrows.get("trade", aSlot).set(
+        x1: entryT,
+        y1: entry,
+        x2: t,
+        y2: exitPx,
+        color: pnl > 0.0 ? color.green : color.red,
+        width: 2,
+      )
+      dir = 0.0
+    } else {
+      // Stop moves take effect from the next bar (conservative).
+      let beHit = beR > 0.0 && !enteredNow && (dir > 0.0 ? hi >= beTrig : lo <= beTrig)
+      if tp1Done > 0.5 || beHit {
+        stopPx = entry
+        movedBe = 1.0
+      }
+    }
+  }
+
+  // Snapshot the running totals every 100 bars; midIdx follows the middle one.
+  blk = blk + 1
+  if blk >= 100 {
+    blk = 0
+    snapN.push(trades)
+    snapG.push(cumGross)
+    snapE.push(cum)
+    if flip == 1 {
+      midIdx = midIdx + 1
+    }
+    flip = 1 - flip
+  }
+
+  // 4. Benchmark books: no signal, same stop size, target multiple and holding
+  //    time. Entry at the bar close every `benchHrs` hours when the book is
+  //    flat; managed from the next bar, stop checked before target.
+  let benchSl = benchSlBps > 0.0 ? benchSlBps : (entries > 0.0 ? slSum / entries : minSlBps)
+
+  if blOpen > 0.5 {
+    blHeld = blHeld + 1.0
+    let blHitStop = lo <= blStop
+    let blHitTgt = hi >= blTgt
+    if blHitStop || blHitTgt || blHeld >= maxBars {
+      let blExit = blHitStop ? blStop : (blHitTgt ? blTgt : px)
+      blGross = blGross + (blExit - blEntry) / blEntry * 10000.0
+      blN = blN + 1.0
+      blOpen = 0.0
+    }
+  }
+  if blOpen < 0.5 && barNo - blLast >= everyBars && px > 0.0 {
+    blOpen = 1.0
+    blEntry = px
+    blStop = px * (1.0 - benchSl / 10000.0)
+    blTgt = px * (1.0 + (tpMode == 1 ? tpBps : tpR * benchSl) / 10000.0)
+    blHeld = 0.0
+    blLast = barNo
+  }
+
+  if bsOpen > 0.5 {
+    bsHeld = bsHeld + 1.0
+    let bsHitStop = hi >= bsStop
+    let bsHitTgt = lo <= bsTgt
+    if bsHitStop || bsHitTgt || bsHeld >= maxBars {
+      let bsExit = bsHitStop ? bsStop : (bsHitTgt ? bsTgt : px)
+      bsGross = bsGross + (bsEntry - bsExit) / bsEntry * 10000.0
+      bsN = bsN + 1.0
+      bsOpen = 0.0
+    }
+  }
+  if bsOpen < 0.5 && barNo - bsLast >= everyBars && px > 0.0 {
+    bsOpen = 1.0
+    bsEntry = px
+    bsStop = px * (1.0 + benchSl / 10000.0)
+    bsTgt = px * (1.0 - (tpMode == 1 ? tpBps : tpR * benchSl) / 10000.0)
+    bsHeld = 0.0
+    bsLast = barNo
+  }
+
+  // 5. A new heavy-volume bar starts a new zone. It only replaces a zone that
+  //    has not been proven yet; a proven zone lives until traded or expired.
+  // Multi-venue aggression: same-direction delta spikes on several venues.
+  let dS = vdS.close ?? 0.0
+  let dF = vdF.close ?? 0.0
+  let dI = vdI.close ?? 0.0
+  seenS = dS != 0.0 ? 1.0 : seenS
+  seenF = dF != 0.0 ? 1.0 : seenF
+  seenI = dI != 0.0 ? 1.0 : seenI
+  let warm = barNo > math.round(volLen)
+  let upS = warm && emaS > 0.0 && dS > aggMult * emaS
+  let dnS = warm && emaS > 0.0 && -dS > aggMult * emaS
+  let upF = warm && emaF > 0.0 && dF > aggMult * emaF
+  let dnF = warm && emaF > 0.0 && -dF > aggMult * emaF
+  let upI = warm && emaI > 0.0 && dI > aggMult * emaI
+  let dnI = warm && emaI > 0.0 && -dI > aggMult * emaI
+  let upN = (upS ? 1.0 : 0.0) + (upF ? 1.0 : 0.0) + (upI ? 1.0 : 0.0)
+  let dnN = (dnS ? 1.0 : 0.0) + (dnF ? 1.0 : 0.0) + (dnI ? 1.0 : 0.0)
+  let need = minVenues == 2 ? 2.0 : 3.0
+  let aggUp = upN >= need && dnN == 0.0
+  let aggDn = dnN >= need && upN == 0.0
+  let alpha = 2.0 / (math.round(volLen) + 1.0)
+  emaS = emaS + alpha * (math.abs(dS) - emaS)
+  emaF = emaF + alpha * (math.abs(dF) - emaF)
+  emaI = emaI + alpha * (math.abs(dI) - emaI)
+  trigUp = aggUp ? trigUp + 1.0 : trigUp
+  trigDn = aggDn ? trigDn + 1.0 : trigDn
+
+  let heavy = avgVol != null && vol > (avgVol ?? 0.0) * volMult
+  let trig = trigMode == 0 ? (aggUp || aggDn) : heavy
+  if trig && zState <= 1 {
+    zDir = aggUp ? 1.0 : (aggDn ? -1.0 : 0.0)
+    zState = 1
+    zHi = hi
+    zLo = lo
+    zT = t
+    zAge = 0.0
+    zonesMade = zonesMade + 1.0
+    zCvd = cvd
+    bSlot = bSlot >= 999 ? 0 : bSlot + 1
+  }
+
+  // Draw the active zone as a box that grows until it is used or expires.
+  if zState != 0 {
+    boxes.get("zone", bSlot).set(
+      x1: zT,
+      y1: zHi,
+      x2: t,
+      y2: zLo,
+      color: color.withAlpha(color.blue, 45),
+      borderColor: color.withAlpha(color.blue, 160),
+      borderWidth: 1,
+    )
+  }
+
+  longIn.plot(enteredNow && dir > 0.0 ? entry : gap)
+  shortIn.plot(enteredNow && dir < 0.0 ? entry : gap)
+  divMark.plot(enteredNow && tradeDiv > 0.5 ? entry : gap)
+  equity.plot(cum)
+  grossEq.plot(cumGross)
+
+  // 6. Results table.
+  let winRate = trades > 0.0 ? wins / trades * 100.0 : 0.0
+  let tgtRate = trades > 0.0 ? targets / trades * 100.0 : 0.0
+  let stopRate = trades > 0.0 ? stops / trades * 100.0 : 0.0
+  let toRate = trades > 0.0 ? timeouts / trades * 100.0 : 0.0
+  let avgNet = trades > 0.0 ? cum / trades : 0.0
+  let avgGross = trades > 0.0 ? cumGross / trades : 0.0
+  let avgLong = longs > 0.0 ? longGross / longs : 0.0
+  let avgShort = shorts > 0.0 ? shortGross / shorts : 0.0
+  results.tbl.row("01", "Zones formed / proven", str.format("{0:.0} / {1:.0}", zonesMade, zonesProven))
+  results.tbl.row("02", "Trades", str.format("{0:.0}", trades))
+  results.tbl.row("03", "Target hit", str.format("{0:.1}%", tgtRate))
+  results.tbl.row("04", "Stop hit", str.format("{0:.1}%", stopRate))
+  results.tbl.row("05", "Timed out", str.format("{0:.1}%", toRate))
+  results.tbl.row("06", "Net-positive trades", str.format("{0:.1}%", winRate))
+  results.tbl.row("07", "Avg gross / trade (bps)", str.format("{0:+.1}", avgGross))
+  results.tbl.row("08", "Avg net / trade (bps)",
+    table.cell(trades > 0.0 ? str.format("{0:+.1}", avgNet) : "n/a (no trades)", fg: trades > 0.0 ? (avgNet >= 0.0 ? color.green : color.red) : color.gray))
+  results.tbl.row("09", "Total net (bps)", str.format("{0:+.0}", cum))
+  results.tbl.row("10", "Max drawdown (bps)", str.format("{0:.0}", maxDd))
+  results.tbl.row("11", "Longs: n / avg gross", str.format("{0:.0} / {1:+.1}", longs, avgLong))
+  results.tbl.row("12", "Shorts: n / avg gross", str.format("{0:.0} / {1:+.1}", shorts, avgShort))
+  results.tbl.row("13", "Position now", dir > 0.0 ? "long" : (dir < 0.0 ? "short" : "flat"))
+
+  let days = barNo * tfMin / 1440.0
+  let h1n = snapN[midIdx] ?? 0.0
+  let h1Gross = snapG[midIdx] ?? 0.0
+  let h1Net = snapE[midIdx] ?? 0.0
+  let h2n = trades - h1n
+  let h2Gross = cumGross - h1Gross
+  let h2Net = cum - h1Net
+  let h1g = h1n > 0.0 ? h1Gross / h1n : 0.0
+  let h1e = h1n > 0.0 ? h1Net / h1n : 0.0
+  let h2g = h2n > 0.0 ? h2Gross / h2n : 0.0
+  let h2e = h2n > 0.0 ? h2Net / h2n : 0.0
+  results.tbl.row("14", "Bars / days loaded", str.format("{0:.0} / {1:.1}", barNo, days))
+  results.tbl.row("15", "1st half (auto): n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", h1n, h1g, h1e))
+  results.tbl.row("16", "2nd half (auto): n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", h2n, h2g, h2e))
+  results.tbl.row("17", "Entry mode", entryMode == 0 ? "on retest" : "on proof")
+
+  // Benchmark comparison.
+  let avgStop = entries > 0.0 ? slSum / entries : 0.0
+  let mkt = firstPx > 0.0 ? (px / firstPx - 1.0) * 10000.0 : 0.0
+  let bLong = blN > 0.0 ? blGross / blN : 0.0
+  let bShort = bsN > 0.0 ? bsGross / bsN : 0.0
+  let edgeLong = avgLong - bLong
+  let edgeShort = avgShort - bShort
+  results.tbl.row("18", "Market move over window (bps)", str.format("{0:+.0}", mkt))
+  results.tbl.row("19", "Strategy avg stop / bench stop (bps)", str.format("{0:.1} / {1:.1}", avgStop, benchSl))
+  results.tbl.row("20", "Bench longs: n / avg gross", str.format("{0:.0} / {1:+.1}", blN, bLong))
+  results.tbl.row("21", "Bench shorts: n / avg gross", str.format("{0:.0} / {1:+.1}", bsN, bShort))
+  let txtEdgeL = longs > 0.0 ? str.format("{0:+.1}", edgeLong) : "n/a (no longs)"
+  let txtEdgeS = shorts > 0.0 ? str.format("{0:+.1}", edgeShort) : "n/a (no shorts)"
+  let colEdgeL = longs > 0.0 ? (edgeLong >= 0.0 ? color.green : color.red) : color.gray
+  let colEdgeS = shorts > 0.0 ? (edgeShort >= 0.0 ? color.green : color.red) : color.gray
+  results.tbl.row("22", "Longs vs bench (bps/trade)", table.cell(txtEdgeL, fg: colEdgeL))
+  results.tbl.row("23", "Shorts vs bench (bps/trade)", table.cell(txtEdgeS, fg: colEdgeS))
+
+  // CVD divergence groups.
+  let dvG = dvN > 0.0 ? dvGross / dvN : 0.0
+  let dvE = dvN > 0.0 ? dvNet / dvN : 0.0
+  let ndG = ndN > 0.0 ? ndGross / ndN : 0.0
+  let ndE = ndN > 0.0 ? ndNet / ndN : 0.0
+  results.tbl.row("24", "With CVD div: n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", dvN, dvG, dvE))
+  results.tbl.row("25", "Without CVD div: n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", ndN, ndG, ndE))
+  results.tbl.row("26", "CVD filter", cvdMode == 0 ? "tag only" : (cvdMode == 1 ? "only div" : "only no-div"))
+
+  // Frequency and money view.
+  let perDay = days > 0.0 ? trades / days : 0.0
+  let avgR = trades > 0.0 ? cumR / trades : 0.0
+  let riskUsd = acctUsd * riskPct / 100.0
+  let avgUsd = avgR * riskUsd
+  let totUsd = cumR * riskUsd
+  let ddUsd = maxDdR * riskUsd
+  let notional = avgStop > 0.0 ? riskUsd / (avgStop / 10000.0) : 0.0
+  results.tbl.row("27", "Trades per day / per week", str.format("{0:.2} / {1:.1}", perDay, perDay * 7.0))
+  results.tbl.row("28", "Avg net in R / total R / max DD R", str.format("{0:+.2} / {1:+.1} / {2:.1}", avgR, cumR, maxDdR))
+  results.tbl.row("29", "Risk $ per trade / avg position size $", str.format("{0:.0} / {1:.0}", riskUsd, notional))
+  results.tbl.row("30", "Avg $ per trade (net)",
+    table.cell(str.format("{0:+.0}", avgUsd), fg: avgUsd >= 0.0 ? color.green : color.red))
+  let avgCost = trades > 0.0 ? (cumGross - cum) / trades : 0.0
+  results.tbl.row("32", "Zones touched but not filled (missed)", str.format("{0:.0}", missed))
+  results.tbl.row("33", "TP1 hits / exits at entry (breakeven)", str.format("{0:.0} / {1:.0}", tp1Count, beExits))
+  results.tbl.row("34", "Avg cost / trade (bps)", str.format("{0:.1}", avgCost))
+  let feedTxt = seenS > 0.5 ? (seenF > 0.5 ? (seenI > 0.5 ? "spot ok / perp ok / inverse ok" : "spot ok / perp ok / inverse MISSING") : "spot ok / perp MISSING") : "spot MISSING"
+  results.tbl.row("36", "Venue feeds (binance / binancef / deribit)", feedTxt)
+  results.tbl.row("37", "Aggression triggers: buy / sell", str.format("{0:.0} / {1:.0}", trigUp, trigDn))
+  results.tbl.row("38", "Trigger", trigMode == 0 ? str.format("multi-venue, {0:.0} venues, {1:.1}x", need, aggMult) : "heavy volume (old)")
+  results.tbl.row("35", "Target mode", tpMode == 1 ? str.format("fixed {0:.0} bps", tpBps) : str.format("{0:.1} x stop", tpR))
+  results.tbl.row("31", "Total $ / max drawdown $", str.format("{0:+.0} / {1:.0}", totUsd, ddUsd))
+}
