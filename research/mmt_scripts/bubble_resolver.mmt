@@ -1,0 +1,575 @@
+script "Bubble Resolver v8.4 (Matthias & Claude)"
+
+// One event, two outcomes ("effort vs result"):
+//   A big volume-delta bubble at a fresh high/low is EFFORT. What price does in
+//   the next bars is the RESULT.
+//   CONTINUATION (effort with result): within `resolveBars` a close beyond the
+//     bubble's extreme by `awayBps` -> the bubble bar becomes a zone; on the
+//     first pullback into it, limit entry WITH the bubble at the zone edge,
+//     stop beyond the bubble's far end.
+//   ABSORPTION (effort without result): no bar gets beyond the bubble's
+//     extreme and price closes back past the bubble bar's midpoint - OR a
+//     second same-side bubble fails to make a new extreme (cluster) ->
+//     market entry AGAINST the bubble, stop beyond the bubble extreme.
+//   Neither within `resolveBars` -> discarded.
+// v8.4: optional INVALIDATION EXIT for reclaim trades ("bubble eaten
+//   again"): within the first `invalBars` bars after entry, a close back
+//   through the reclaim level exits at that close. 0 = off (= v8.3).
+// v8.3: bubbles from BIG TRADES only (default): the net delta of the two
+//   largest size tiers (buckets 10 + 11, shown in rows 01b/01c - check they
+//   read $1M-5M and $5M+; edit the numbers in the vdA / vdB lines if not).
+//   A bar can hold a huge sell print yet close with positive total delta, so
+//   all-trade delta can mark the opposite side of MMT's bubble.
+//   Default branch is now 3 (reclaim).
+// v8.2: volume delta from 7 futures venues combined (like "Volume Bubbles
+//   (7 venues)"): binancef, bybitf, okxf, bitmexf, deribitf, bitfinexf,
+//   hyperliquid. Edit the list in the `data vd` line to match your overlay.
+// v8.1 adds branch 3 = RECLAIM (Matthias's 3 marked trades):
+//   a bubble where one side dominates (sell bubble = shorts aggressive, buy
+//   bubble = longs aggressive). Its LEVEL = the bubble bar's open (where the
+//   aggressors started; option: body midpoint). Within `reclaimBars`, a close
+//   back through that level puts them underwater -> trade against them at
+//   the close (market). Price may first run further (no "no extension" rule);
+//   the stop goes beyond the extreme reached since the bubble.
+// Branch setting: 0 = both, 1 = continuation only, 2 = absorption only.
+// Each branch is reported separately (rows 20-27). Run 1 and 2 on their own.
+// Use an AGGREGATED chart (e.g. Futures, 7 venues): the script reads the
+// chart's own volume delta. Benchmark, halves, R/$, fees as in v7.
+
+data chart = subscribe(data.ohlcv, history: 20000)
+data vd = subscribe(data.vd, exchange: markets.agg("binancef", "bybitf", "okxf", "bitmexf", "deribitf", "bitfinexf", "hyperliquid"), history: 20000)
+data vdA = subscribe(data.vd, exchange: markets.agg("binancef", "bybitf", "okxf", "bitmexf", "deribitf", "bitfinexf", "hyperliquid"), bucket: 10, history: 20000)
+data vdB = subscribe(data.vd, exchange: markets.agg("binancef", "bybitf", "okxf", "bitmexf", "deribitf", "bitfinexf", "hyperliquid"), bucket: 11, history: 20000)
+
+input (
+  branch     = input.int(3, title: "Branch: 0 = cont+abs, 1 = continuation, 2 = absorption, 3 = reclaim", min: 0, max: 3)
+  bubSrc     = input.int(0, title: "Bubble source: 0 = big trades (buckets 10+11), 1 = all trades", min: 0, max: 1)
+  reclaimBars = input.int(8, title: "Reclaim: bars allowed to close back through the level", min: 1, max: 100)
+  invalBars  = input.int(0, title: "Reclaim: exit if level lost again within N bars (0 = off)", min: 0, max: 100)
+  reclaimLvl = input.int(0, title: "Reclaim level: 0 = bubble bar open, 1 = body midpoint", min: 0, max: 1)
+  bubLen     = input.int(60, title: "Bubble: average length (bars)", min: 5, max: 500)
+  bubMult    = input.float(8.0, title: "Bubble: |delta| > x average", min: 1.0, max: 50.0)
+  swingLen   = input.int(20, title: "Bubble at fresh high/low of N bars (0 = anywhere)", min: 0, max: 500)
+  resolveBars = input.int(3, title: "Bars to resolve continuation vs absorption", min: 1, max: 50)
+  awayBps    = input.float(10.0, title: "Continuation: close beyond bubble by (bps)", min: 0.0, max: 500.0)
+  expireHrs  = input.float(4.0, title: "Continuation: zone expiry (hours)", min: 0.1, max: 168.0)
+  fillThruBps = input.float(1.0, title: "Limit fill: trade-through needed (bps)", min: 0.0, max: 50.0)
+  bufferBps  = input.float(5.0, title: "Stop buffer beyond bubble (bps)", min: 0.0, max: 200.0)
+  minSlBps   = input.float(25.0, title: "Min stop distance (bps)", min: 1.0, max: 500.0)
+  maxSlBps   = input.float(300.0, title: "Max stop distance (bps) - wider = skip", min: 5.0, max: 3000.0)
+  tpR        = input.float(1.5, title: "Target (x stop distance)", min: 0.2, max: 20.0)
+  maxHrs     = input.float(4.0, title: "Max time in trade (hours)", min: 0.1, max: 168.0)
+  makerBps   = input.float(2.0, title: "Fee maker, per side (bps)", min: 0.0, max: 50.0)
+  takerBps   = input.float(5.5, title: "Fee taker, per side (bps)", min: 0.0, max: 50.0)
+  slipBps    = input.float(1.0, title: "Slippage on market orders (bps)", min: 0.0, max: 50.0)
+  benchHrs   = input.float(1.0, title: "Benchmark: new entry every (hours)", min: 0.1, max: 168.0)
+  benchSlBps = input.float(0.0, title: "Benchmark stop (bps, 0 = strategy avg)", min: 0.0, max: 3000.0)
+  acctUsd    = input.float(100000.0, title: "Account size ($)", min: 1000.0, max: 10000000.0)
+  riskPct    = input.float(0.5, title: "Risk per trade (% of account)", min: 0.05, max: 5.0)
+)
+
+pane eqPane = pane(title: "Cumulative PnL (bps): net, gross in grey", height: 0.25)
+
+plot (
+  equity  = plot.line(title: "Cum Net PnL (bps)", on: eqPane, width: 2)
+  grossEq = plot.line(title: "Cum Gross PnL (bps)", on: eqPane, color: color.gray, width: 1)
+  longIn  = plot.marker(title: "Long entry", shape: shape.up, color: color.green, size: 10)
+  shortIn = plot.marker(title: "Short entry", shape: shape.down, color: color.red, size: 10)
+  buyBubM = plot.marker(title: "Buy bubble", shape: shape.circle, color: color.green, size: 7)
+  sellBubM = plot.marker(title: "Sell bubble", shape: shape.circle, color: color.red, size: 7)
+)
+
+window results = window(title: "Bubble Resolver v8.4") {
+  tbl: table.new([
+    table.col(title: "Metric"),
+    table.col(title: "Value", align: align.right),
+  ], title: "Results", capacity: 48),
+}
+
+state (
+  arrows = entities.arrowPool(max: 1000)
+  boxes = entities.boxPool(max: 1000)
+  aSlot: int = 0
+  bSlot: int = 0
+
+  emaAbs: float = 0.0
+
+  // watch: 0 = none, 1 = resolving, 2 = continuation zone waiting for retest
+  wState: float = 0.0
+  wDir: float = 0.0
+  bHi: float = 0.0
+  bLo: float = 0.0
+  bT = time.fromUnixSeconds(0)
+  wAge: float = 0.0
+  wExt: float = 0.0
+
+  // counters
+  bubbles: float = 0.0
+  contConf: float = 0.0
+  absConf: float = 0.0
+  clusterConf: float = 0.0
+  unresolved: float = 0.0
+  zoneExpired: float = 0.0
+  skipped: float = 0.0
+
+  // open trade
+  dir: float = 0.0
+  entry: float = 0.0
+  stopPx: float = 0.0
+  tgtPx: float = 0.0
+  held: float = 0.0
+  entryT = time.fromUnixSeconds(0)
+  tradeSlBps: float = 0.0
+  tradeBranch: float = 0.0
+  entryFee: float = 0.0
+
+  // statistics
+  entries: float = 0.0
+  slSum: float = 0.0
+  trades: float = 0.0
+  wins: float = 0.0
+  targets: float = 0.0
+  stops: float = 0.0
+  timeouts: float = 0.0
+  longs: float = 0.0
+  longGross: float = 0.0
+  shorts: float = 0.0
+  shortGross: float = 0.0
+  cum: float = 0.0
+  cumGross: float = 0.0
+  cumR: float = 0.0
+  peakR: float = 0.0
+  maxDdR: float = 0.0
+  barNo: float = 0.0
+  firstPx: float = 0.0
+
+  // per branch: continuation (c) and absorption (a)
+  cN: float = 0.0
+  cGross: float = 0.0
+  cNet: float = 0.0
+  cLN: float = 0.0
+  cLG: float = 0.0
+  cSN: float = 0.0
+  cSG: float = 0.0
+  aN: float = 0.0
+  aGross: float = 0.0
+  aNet: float = 0.0
+  aLN: float = 0.0
+  aLG: float = 0.0
+  aSN: float = 0.0
+  aSG: float = 0.0
+
+  // reclaim branch (r)
+  rState: float = 0.0
+  rDir: float = 0.0
+  rLevel: float = 0.0
+  rExt: float = 0.0
+  rAge: float = 0.0
+  rConf: float = 0.0
+  rExpired: float = 0.0
+  rN: float = 0.0
+  rGross: float = 0.0
+  rNet: float = 0.0
+  rLN: float = 0.0
+  rLG: float = 0.0
+  rSN: float = 0.0
+  rSG: float = 0.0
+  tradeLevel: float = 0.0
+  invalExits: float = 0.0
+
+  // automatic halves
+  snapN = float[](1000)
+  snapG = float[](1000)
+  snapE = float[](1000)
+  blk: int = 0
+  midIdx: int = 0
+  flip: int = 0
+
+  // benchmark books
+  blOpen: float = 0.0
+  blEntry: float = 0.0
+  blStop: float = 0.0
+  blTgt: float = 0.0
+  blHeld: float = 0.0
+  blLast: float = -1000000.0
+  blN: float = 0.0
+  blGross: float = 0.0
+  bsOpen: float = 0.0
+  bsEntry: float = 0.0
+  bsStop: float = 0.0
+  bsTgt: float = 0.0
+  bsHeld: float = 0.0
+  bsLast: float = -1000000.0
+  bsN: float = 0.0
+  bsGross: float = 0.0
+)
+
+on chart.close {
+  // Series functions first, before any branching.
+  let hh = ta.highest(chart.high, swingLen == 0 ? 1 : swingLen)
+  let ll = ta.lowest(chart.low, swingLen == 0 ? 1 : swingLen)
+
+  let t = chart.time ?? time.fromUnixSeconds(0)
+  let hi = chart.high ?? 0.0
+  let lo = chart.low ?? 0.0
+  let px = chart.close ?? 0.0
+  let op = chart.open ?? 0.0
+  let dAll = vd.close ?? 0.0
+  let dBig = (vdA.close ?? 0.0) + (vdB.close ?? 0.0)
+  let d = bubSrc == 0 ? dBig : dAll
+  let gap: float? = null
+  let tfMin = math.round(time.tfSeconds(context.timeframe)) / 60.0
+  let maxBars = maxHrs * 60.0 / tfMin
+  let expireBars = expireHrs * 60.0 / tfMin
+  let everyBars = benchHrs * 60.0 / tfMin
+  barNo = barNo + 1.0
+  firstPx = firstPx > 0.0 ? firstPx : px
+  let wasFlat = dir == 0.0
+  let allowC = branch == 0 || branch == 1
+  let allowA = branch == 0 || branch == 2
+  let thru = fillThruBps / 10000.0
+
+  // 1. Bubble on this bar? (threshold = average BEFORE this bar)
+  let warm = barNo > math.round(bubLen)
+  let thr = bubMult * emaAbs
+  let atHigh = swingLen == 0 || hi >= (hh ?? hi)
+  let atLow = swingLen == 0 || lo <= (ll ?? lo)
+  let rawBuy = warm && emaAbs > 0.0 && d > thr
+  let rawSell = warm && emaAbs > 0.0 && -d > thr
+  let buyBub = rawBuy && atHigh
+  let sellBub = rawSell && atLow
+  let alpha = 2.0 / (math.round(bubLen) + 1.0)
+  emaAbs = emaAbs + alpha * (math.abs(d) - emaAbs)
+  bubbles = (buyBub || sellBub) ? bubbles + 1.0 : bubbles
+
+  // 2. Resolve the bubble being watched (bars AFTER the bubble bar).
+  let bMid = (bHi + bLo) / 2.0
+  let isWatch = wState > 0.5 && wState < 1.5
+  let extNow = isWatch && (wDir > 0.0 ? hi > bHi : lo < bLo)
+  wExt = extNow ? 1.0 : wExt
+  // cluster: another same-side bubble (any location) that fails to extend
+  let sameBub = wDir > 0.0 ? rawBuy : rawSell
+  let clusterNow = isWatch && sameBub && !extNow
+  let contNow = isWatch && (wDir > 0.0 ? px >= bHi * (1.0 + awayBps / 10000.0) : px <= bLo * (1.0 - awayBps / 10000.0))
+  let absNow = isWatch && !contNow && (clusterNow || (wExt < 0.5 && (wDir > 0.0 ? px < bMid : px > bMid)))
+  wAge = isWatch ? wAge + 1.0 : wAge
+  let unresNow = isWatch && !contNow && !absNow && wAge >= math.round(resolveBars)
+  contConf = contNow ? contConf + 1.0 : contConf
+  absConf = absNow ? absConf + 1.0 : absConf
+  clusterConf = clusterNow ? clusterConf + 1.0 : clusterConf
+  unresolved = unresNow ? unresolved + 1.0 : unresolved
+  // absorption entry info captured before the watch is cleared
+  let absDir = -wDir
+  let absRef = wDir > 0.0 ? math.max(bHi, hi) : math.min(bLo, lo)
+  if contNow {
+    wState = 2.0
+    wAge = 0.0
+  }
+  if absNow || unresNow {
+    wState = 0.0
+  }
+
+  // 3. Continuation zone: retest -> limit entry at the bubble edge.
+  let isZone = wState > 1.5 && !contNow
+  let zoneOld = isZone && wAge >= expireBars
+  zoneExpired = zoneOld ? zoneExpired + 1.0 : zoneExpired
+  if zoneOld {
+    wState = 0.0
+  }
+  wAge = (isZone && !zoneOld) ? wAge + 1.0 : wAge
+  let retest = isZone && !zoneOld && (wDir > 0.0 ? lo <= bHi * (1.0 - thru) : hi >= bLo * (1.0 + thru))
+
+  // 3b. Reclaim watch: a close back through the bubble's level within
+  //     `reclaimBars` (buy bubble -> close below level -> short; sell bubble
+  //     -> close above level -> long). rExt tracks the extreme since the bubble.
+  let isR = rState > 0.5
+  rAge = isR ? rAge + 1.0 : rAge
+  rExt = isR ? (rDir > 0.0 ? math.max(rExt, hi) : math.min(rExt, lo)) : rExt
+  let rTrig = isR && (rDir > 0.0 ? px < rLevel : px > rLevel)
+  let rOld = isR && !rTrig && rAge >= math.round(reclaimBars)
+  rConf = rTrig ? rConf + 1.0 : rConf
+  rExpired = rOld ? rExpired + 1.0 : rExpired
+  let recDir = -rDir
+  let recRef = rExt
+  if rTrig || rOld {
+    rState = 0.0
+  }
+
+  // 4. Entries (only when flat).
+  let goCont = wasFlat && allowC && retest
+  let goAbs = wasFlat && allowA && absNow && !goCont
+  let goRec = wasFlat && branch == 3 && rTrig
+  if goCont || goAbs || goRec {
+    let dd = goCont ? wDir : (goRec ? recDir : absDir)
+    let fillPx = goCont ? (wDir > 0.0 ? bHi : bLo) : px
+    let refX = goRec ? recRef : absRef
+    let stopLevel = goCont ? (wDir > 0.0 ? bLo * (1.0 - bufferBps / 10000.0) : bHi * (1.0 + bufferBps / 10000.0)) : (dd > 0.0 ? refX * (1.0 - bufferBps / 10000.0) : refX * (1.0 + bufferBps / 10000.0))
+    let slDist = math.max(math.abs(fillPx - stopLevel), fillPx * minSlBps / 10000.0)
+    let slBps = slDist / fillPx * 10000.0
+    if slBps > maxSlBps {
+      skipped = skipped + 1.0
+    } else {
+      dir = dd
+      entry = fillPx
+      stopPx = fillPx - dd * slDist
+      tgtPx = fillPx + dd * tpR * slDist
+      held = 0.0
+      entryT = t
+      tradeSlBps = slBps
+      tradeBranch = goCont ? 1.0 : (goRec ? 3.0 : 2.0)
+      tradeLevel = rLevel
+      entryFee = goCont ? makerBps : takerBps + slipBps
+      entries = entries + 1.0
+      slSum = slSum + slBps
+    }
+  }
+  if retest {
+    wState = 0.0
+  }
+  let enteredNow = wasFlat && dir != 0.0
+  let limitEntry = enteredNow && tradeBranch < 1.5
+
+  // 5. Manage the open trade. Limit entries: only the stop may trigger on the
+  //    entry bar. Market entries: managed from the next bar.
+  if dir != 0.0 && (!enteredNow || limitEntry) {
+    held = enteredNow ? held : held + 1.0
+    let hitStop = dir > 0.0 ? lo <= stopPx : hi >= stopPx
+    let hitTgt = !enteredNow && !hitStop && (dir > 0.0 ? hi >= tgtPx : lo <= tgtPx)
+    let invalNow = invalBars > 0 && tradeBranch > 2.5 && !hitStop && !hitTgt && held <= math.round(invalBars) && (dir > 0.0 ? px < tradeLevel : px > tradeLevel)
+    invalExits = invalNow ? invalExits + 1.0 : invalExits
+    if hitStop || hitTgt || held >= maxBars || invalNow {
+      let exitPx = hitStop ? stopPx : (hitTgt ? tgtPx : px)
+      let gross = (exitPx - entry) / entry * 10000.0 * dir
+      let exitFee = hitTgt ? makerBps : takerBps + slipBps
+      let pnl = gross - (entryFee + exitFee)
+      cum = cum + pnl
+      cumGross = cumGross + gross
+      cumR = cumR + pnl / tradeSlBps
+      peakR = math.max(peakR, cumR)
+      maxDdR = math.max(maxDdR, peakR - cumR)
+      trades = trades + 1.0
+      wins = pnl > 0.0 ? wins + 1.0 : wins
+      stops = hitStop ? stops + 1.0 : stops
+      targets = hitTgt ? targets + 1.0 : targets
+      timeouts = (!hitStop && !hitTgt) ? timeouts + 1.0 : timeouts
+      longs = dir > 0.0 ? longs + 1.0 : longs
+      longGross = dir > 0.0 ? longGross + gross : longGross
+      shorts = dir < 0.0 ? shorts + 1.0 : shorts
+      shortGross = dir < 0.0 ? shortGross + gross : shortGross
+      let isC = tradeBranch < 1.5
+      let isRc = tradeBranch > 2.5
+      let isA = !isC && !isRc
+      let isL = dir > 0.0
+      cN = isC ? cN + 1.0 : cN
+      cGross = isC ? cGross + gross : cGross
+      cNet = isC ? cNet + pnl : cNet
+      cLN = (isC && isL) ? cLN + 1.0 : cLN
+      cLG = (isC && isL) ? cLG + gross : cLG
+      cSN = (isC && !isL) ? cSN + 1.0 : cSN
+      cSG = (isC && !isL) ? cSG + gross : cSG
+      aN = isA ? aN + 1.0 : aN
+      aGross = isA ? aGross + gross : aGross
+      aNet = isA ? aNet + pnl : aNet
+      aLN = (isA && isL) ? aLN + 1.0 : aLN
+      aLG = (isA && isL) ? aLG + gross : aLG
+      aSN = (isA && !isL) ? aSN + 1.0 : aSN
+      aSG = (isA && !isL) ? aSG + gross : aSG
+      rN = isRc ? rN + 1.0 : rN
+      rGross = isRc ? rGross + gross : rGross
+      rNet = isRc ? rNet + pnl : rNet
+      rLN = (isRc && isL) ? rLN + 1.0 : rLN
+      rLG = (isRc && isL) ? rLG + gross : rLG
+      rSN = (isRc && !isL) ? rSN + 1.0 : rSN
+      rSG = (isRc && !isL) ? rSG + gross : rSG
+      aSlot = aSlot >= 999 ? 0 : aSlot + 1
+      arrows.get("trade", aSlot).set(
+        x1: entryT,
+        y1: entry,
+        x2: t,
+        y2: exitPx,
+        color: pnl > 0.0 ? color.green : color.red,
+        width: 2,
+      )
+      dir = 0.0
+    }
+  }
+
+  // 6. A new bubble starts a new watch (unless it was used as a cluster).
+  // A new bubble also starts a reclaim watch (branch 3).
+  if buyBub || sellBub {
+    rState = 1.0
+    rDir = buyBub ? 1.0 : -1.0
+    rLevel = reclaimLvl == 0 ? op : (op + px) / 2.0
+    rExt = buyBub ? hi : lo
+    rAge = 0.0
+  }
+
+  if (buyBub || sellBub) && !clusterNow && !contNow {
+    wState = 1.0
+    wDir = buyBub ? 1.0 : -1.0
+    bHi = hi
+    bLo = lo
+    bT = t
+    wAge = 0.0
+    wExt = 0.0
+    bSlot = bSlot >= 999 ? 0 : bSlot + 1
+  }
+
+  // Bubble zone box while it is being watched or waiting for the retest.
+  if wState > 0.5 {
+    boxes.get("bubble", bSlot).set(
+      x1: bT,
+      y1: bHi,
+      x2: t,
+      y2: bLo,
+      color: wDir > 0.0 ? color.withAlpha(color.green, 35) : color.withAlpha(color.red, 35),
+      borderColor: wDir > 0.0 ? color.withAlpha(color.green, 140) : color.withAlpha(color.red, 140),
+      borderWidth: 1,
+    )
+  }
+
+  // Snapshot running totals every 100 bars for the automatic halves.
+  blk = blk + 1
+  if blk >= 100 {
+    blk = 0
+    snapN.push(trades)
+    snapG.push(cumGross)
+    snapE.push(cum)
+    if flip == 1 {
+      midIdx = midIdx + 1
+    }
+    flip = 1 - flip
+  }
+
+  // 7. Benchmark books: no signal, same stop size, target multiple and hold.
+  let benchSl = benchSlBps > 0.0 ? benchSlBps : (entries > 0.0 ? slSum / entries : minSlBps)
+  if blOpen > 0.5 {
+    blHeld = blHeld + 1.0
+    let blHitStop = lo <= blStop
+    let blHitTgt = hi >= blTgt
+    if blHitStop || blHitTgt || blHeld >= maxBars {
+      let blExit = blHitStop ? blStop : (blHitTgt ? blTgt : px)
+      blGross = blGross + (blExit - blEntry) / blEntry * 10000.0
+      blN = blN + 1.0
+      blOpen = 0.0
+    }
+  }
+  if blOpen < 0.5 && barNo - blLast >= everyBars && px > 0.0 {
+    blOpen = 1.0
+    blEntry = px
+    blStop = px * (1.0 - benchSl / 10000.0)
+    blTgt = px * (1.0 + tpR * benchSl / 10000.0)
+    blHeld = 0.0
+    blLast = barNo
+  }
+  if bsOpen > 0.5 {
+    bsHeld = bsHeld + 1.0
+    let bsHitStop = hi >= bsStop
+    let bsHitTgt = lo <= bsTgt
+    if bsHitStop || bsHitTgt || bsHeld >= maxBars {
+      let bsExit = bsHitStop ? bsStop : (bsHitTgt ? bsTgt : px)
+      bsGross = bsGross + (bsEntry - bsExit) / bsEntry * 10000.0
+      bsN = bsN + 1.0
+      bsOpen = 0.0
+    }
+  }
+  if bsOpen < 0.5 && barNo - bsLast >= everyBars && px > 0.0 {
+    bsOpen = 1.0
+    bsEntry = px
+    bsStop = px * (1.0 + benchSl / 10000.0)
+    bsTgt = px * (1.0 - tpR * benchSl / 10000.0)
+    bsHeld = 0.0
+    bsLast = barNo
+  }
+
+  longIn.plot(enteredNow && dir > 0.0 ? entry : gap)
+  shortIn.plot(enteredNow && dir < 0.0 ? entry : gap)
+  buyBubM.plot(buyBub ? hi : gap)
+  sellBubM.plot(sellBub ? lo : gap)
+  equity.plot(cum)
+  grossEq.plot(cumGross)
+
+  // 8. Results table.
+  let tgtRate = trades > 0.0 ? targets / trades * 100.0 : 0.0
+  let stopRate = trades > 0.0 ? stops / trades * 100.0 : 0.0
+  let toRate = trades > 0.0 ? timeouts / trades * 100.0 : 0.0
+  let winRate = trades > 0.0 ? wins / trades * 100.0 : 0.0
+  let avgNet = trades > 0.0 ? cum / trades : 0.0
+  let avgGross = trades > 0.0 ? cumGross / trades : 0.0
+  let avgLong = longs > 0.0 ? longGross / longs : 0.0
+  let avgShort = shorts > 0.0 ? shortGross / shorts : 0.0
+  let days = barNo * tfMin / 1440.0
+  let h1n = snapN[midIdx] ?? 0.0
+  let h1Gross = snapG[midIdx] ?? 0.0
+  let h1Net = snapE[midIdx] ?? 0.0
+  let h2n = trades - h1n
+  let h1g = h1n > 0.0 ? h1Gross / h1n : 0.0
+  let h1e = h1n > 0.0 ? h1Net / h1n : 0.0
+  let h2g = h2n > 0.0 ? (cumGross - h1Gross) / h2n : 0.0
+  let h2e = h2n > 0.0 ? (cum - h1Net) / h2n : 0.0
+  let avgStop = entries > 0.0 ? slSum / entries : 0.0
+  let mkt = firstPx > 0.0 ? (px / firstPx - 1.0) * 10000.0 : 0.0
+  let bLong = blN > 0.0 ? blGross / blN : 0.0
+  let bShort = bsN > 0.0 ? bsGross / bsN : 0.0
+  let edgeLong = avgLong - bLong
+  let edgeShort = avgShort - bShort
+  let txtEdgeL = longs > 0.0 ? str.format("{0:+.1}", edgeLong) : "n/a (no longs)"
+  let txtEdgeS = shorts > 0.0 ? str.format("{0:+.1}", edgeShort) : "n/a (no shorts)"
+  let colEdgeL = longs > 0.0 ? (edgeLong >= 0.0 ? color.green : color.red) : color.gray
+  let colEdgeS = shorts > 0.0 ? (edgeShort >= 0.0 ? color.green : color.red) : color.gray
+  let txtNet = trades > 0.0 ? str.format("{0:+.1}", avgNet) : "n/a (no trades)"
+  let colNet = trades > 0.0 ? (avgNet >= 0.0 ? color.green : color.red) : color.gray
+  let perDay = days > 0.0 ? trades / days : 0.0
+  let avgR = trades > 0.0 ? cumR / trades : 0.0
+  let riskUsd = acctUsd * riskPct / 100.0
+  let notional = avgStop > 0.0 ? riskUsd / (avgStop / 10000.0) : 0.0
+  let avgCost = trades > 0.0 ? (cumGross - cum) / trades : 0.0
+  let cG = cN > 0.0 ? cGross / cN : 0.0
+  let cE = cN > 0.0 ? cNet / cN : 0.0
+  let aG = aN > 0.0 ? aGross / aN : 0.0
+  let aE = aN > 0.0 ? aNet / aN : 0.0
+  let cLA = cLN > 0.0 ? cLG / cLN : 0.0
+  let cSA = cSN > 0.0 ? cSG / cSN : 0.0
+  let aLA = aLN > 0.0 ? aLG / aLN : 0.0
+  let aSA = aSN > 0.0 ? aSG / aSN : 0.0
+  let branchTxt = branch == 1 ? "continuation only" : (branch == 2 ? "absorption only" : (branch == 3 ? "reclaim only" : "continuation + absorption"))
+  let rG = rN > 0.0 ? rGross / rN : 0.0
+  let rE = rN > 0.0 ? rNet / rN : 0.0
+  let rLA = rLN > 0.0 ? rLG / rLN : 0.0
+  let rSA = rSN > 0.0 ? rSG / rSN : 0.0
+
+  results.tbl.row("01b", "Big-trade tier A (bucket 10)", vdA.bucketLabel)
+  results.tbl.row("01c", "Big-trade tier B (bucket 11)", vdB.bucketLabel)
+  results.tbl.row("01", "Bubbles (at fresh high / low)", str.format("{0:.0}", bubbles))
+  results.tbl.row("02", "Resolved: continuation / absorption (of which cluster)", str.format("{0:.0} / {1:.0} ({2:.0})", contConf, absConf, clusterConf))
+  results.tbl.row("03", "Unresolved / zone expired / skipped (stop too wide)", str.format("{0:.0} / {1:.0} / {2:.0}", unresolved, zoneExpired, skipped))
+  results.tbl.row("04", "Trades", str.format("{0:.0}", trades))
+  results.tbl.row("05", "Target / stop / timeout", str.format("{0:.0}% / {1:.0}% / {2:.0}%", tgtRate, stopRate, toRate))
+  results.tbl.row("06", "Net-positive trades", str.format("{0:.1}%", winRate))
+  results.tbl.row("07", "Avg gross / trade (bps)", str.format("{0:+.1}", avgGross))
+  results.tbl.row("08", "Avg net / trade (bps)", table.cell(txtNet, fg: colNet))
+  results.tbl.row("09", "Longs / shorts: n / avg gross", str.format("{0:.0} / {1:+.1}  |  {2:.0} / {3:+.1}", longs, avgLong, shorts, avgShort))
+  results.tbl.row("10", "Bars / days loaded", str.format("{0:.0} / {1:.1}", barNo, days))
+  results.tbl.row("11", "1st half (auto): n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", h1n, h1g, h1e))
+  results.tbl.row("12", "2nd half (auto): n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", h2n, h2g, h2e))
+  results.tbl.row("13", "Market move over window (bps)", str.format("{0:+.0}", mkt))
+  results.tbl.row("14", "Strategy avg stop / bench stop (bps)", str.format("{0:.1} / {1:.1}", avgStop, benchSl))
+  results.tbl.row("15", "Bench longs / shorts: avg gross", str.format("{0:+.1} (n {1:.0})  |  {2:+.1} (n {3:.0})", bLong, blN, bShort, bsN))
+  results.tbl.row("16", "Longs vs bench (bps/trade)", table.cell(txtEdgeL, fg: colEdgeL))
+  results.tbl.row("17", "Shorts vs bench (bps/trade)", table.cell(txtEdgeS, fg: colEdgeS))
+  results.tbl.row("18", "Trades per day / per week", str.format("{0:.2} / {1:.1}", perDay, perDay * 7.0))
+  results.tbl.row("19", "Avg net in R / total R / max DD R", str.format("{0:+.2} / {1:+.1} / {2:.1}", avgR, cumR, maxDdR))
+  results.tbl.row("20", "CONTINUATION: n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", cN, cG, cE))
+  results.tbl.row("21", "  continuation longs / shorts: n / gross", str.format("{0:.0} / {1:+.1}  |  {2:.0} / {3:+.1}", cLN, cLA, cSN, cSA))
+  results.tbl.row("22", "ABSORPTION: n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", aN, aG, aE))
+  results.tbl.row("23", "  absorption longs / shorts: n / gross", str.format("{0:.0} / {1:+.1}  |  {2:.0} / {3:+.1}", aLN, aLA, aSN, aSA))
+  results.tbl.row("24", "Risk $ per trade / avg position size $", str.format("{0:.0} / {1:.0}", riskUsd, notional))
+  results.tbl.row("25", "Avg $ / total $ / max drawdown $", str.format("{0:+.0} / {1:+.0} / {2:.0}", avgR * riskUsd, cumR * riskUsd, maxDdR * riskUsd))
+  results.tbl.row("26", "Avg cost / trade (bps)", str.format("{0:.1}", avgCost))
+  results.tbl.row("23b", "RECLAIM: triggered / expired", str.format("{0:.0} / {1:.0}", rConf, rExpired))
+  results.tbl.row("23c", "RECLAIM: n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", rN, rG, rE))
+  results.tbl.row("23e", "RECLAIM: invalidation exits (level lost again)", str.format("{0:.0}", invalExits))
+  results.tbl.row("23d", "  reclaim longs / shorts: n / gross", str.format("{0:.0} / {1:+.1}  |  {2:.0} / {3:+.1}", rLN, rLA, rSN, rSA))
+  results.tbl.row("27", "Branch", branchTxt)
+  results.tbl.row("28", "Position now", dir > 0.0 ? "long" : (dir < 0.0 ? "short" : "flat"))
+}

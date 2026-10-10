@@ -1,0 +1,592 @@
+script "Stacked Imbalance v9.2 (Matthias & Claude)"
+
+// Stacked footprint imbalances as support / resistance that STAY VALID until
+// price comes back ("buyers/sellers left behind").
+//   1. Per bar, read the footprint (volume profile levels: buy / sell volume
+//      per price row) and find DIAGONAL imbalances like MMT's footprint:
+//        buy imbalance at row i:  buy[i]  >= ratio x sell[i-1]
+//        sell imbalance at row i: sell[i] >= ratio x buy[i+1]
+//      with at least `minVol` on the dominant side (zeros skipped).
+//   2. A stack needs at least `minRows` consecutive imbalance rows (default 5).
+//      The longest stack per side per bar becomes a zone.
+//   3. Up to 50 zones per side are remembered at the same time. A zone stays
+//      valid until it is touched (expiry 0 = never), like MMT's naked lines.
+//   4. Armed once a close is `awayBps` away (price has left the zone).
+//   5. First touch of an armed zone: limit entry at the zone edge (long at a
+//      buy stack, short at a sell stack), stop beyond the far edge, target
+//      tpR x stop, max hold. Every zone touched on that bar is used up.
+// v9.2: reads the footprint of ALL 9 futures venues (like "Footprint (9
+// venues)"), and can merge the profile's fine rows into your footprint's row
+// size ("Row size $", 0 = the profile's own bin). Set it to the row size in
+// your Footprint settings (Row / Scaling) so the stacks match what you see.
+// Benchmark, halves, R/$, fees as before.
+
+data chart = subscribe(data.ohlcv, history: 20000)
+data vol = subscribe(data.volume, exchange: markets.agg("binancef", "bybitf", "okxf", "bitmexf", "deribitf", "bitfinexf", "hyperliquid", "extendedf", "lighterf"), history: 20000)
+
+input (
+  ratio      = input.float(3.0, title: "Imbalance ratio (x)", min: 1.1, max: 50.0)
+  minVol     = input.float(13.0, title: "Min volume on dominant side", min: 0.0, max: 100000.0)
+  minRows    = input.int(5, title: "Min stacked rows for a trading zone", min: 2, max: 50)
+  rowSize    = input.float(0.0, title: "Row size $ (0 = profile bin; match your footprint)", min: 0.0, max: 10000.0)
+  awayBps    = input.float(20.0, title: "Arm: close this far from zone (bps)", min: 0.0, max: 500.0)
+  expireDays = input.float(0.0, title: "Zone expiry (days, 0 = never)", min: 0.0, max: 365.0)
+  fillThruBps = input.float(1.0, title: "Limit fill: trade-through needed (bps)", min: 0.0, max: 50.0)
+  bufferBps  = input.float(5.0, title: "Stop buffer beyond zone (bps)", min: 0.0, max: 200.0)
+  minSlBps   = input.float(20.0, title: "Min stop distance (bps)", min: 1.0, max: 500.0)
+  maxSlBps   = input.float(300.0, title: "Max stop distance (bps) - wider = skip", min: 5.0, max: 3000.0)
+  tpR        = input.float(1.5, title: "Target (x stop distance)", min: 0.2, max: 20.0)
+  maxHrs     = input.float(4.0, title: "Max time in trade (hours)", min: 0.1, max: 168.0)
+  makerBps   = input.float(2.0, title: "Fee maker, per side (bps)", min: 0.0, max: 50.0)
+  takerBps   = input.float(5.5, title: "Fee taker, per side (bps)", min: 0.0, max: 50.0)
+  slipBps    = input.float(1.0, title: "Slippage on market orders (bps)", min: 0.0, max: 50.0)
+  benchHrs   = input.float(1.0, title: "Benchmark: new entry every (hours)", min: 0.1, max: 168.0)
+  benchSlBps = input.float(0.0, title: "Benchmark stop (bps, 0 = strategy avg)", min: 0.0, max: 3000.0)
+  acctUsd    = input.float(100000.0, title: "Account size ($)", min: 1000.0, max: 10000000.0)
+  riskPct    = input.float(0.5, title: "Risk per trade (% of account)", min: 0.05, max: 5.0)
+)
+
+pane eqPane = pane(title: "Cumulative PnL (bps): net, gross in grey", height: 0.25)
+
+plot (
+  equity  = plot.line(title: "Cum Net PnL (bps)", on: eqPane, width: 2)
+  grossEq = plot.line(title: "Cum Gross PnL (bps)", on: eqPane, color: color.gray, width: 1)
+  longIn  = plot.marker(title: "Long entry", shape: shape.up, color: color.green, size: 10)
+  shortIn = plot.marker(title: "Short entry", shape: shape.down, color: color.red, size: 10)
+)
+
+window results = window(title: "Stacked Imbalance v9.2") {
+  tbl: table.new([
+    table.col(title: "Metric"),
+    table.col(title: "Value", align: align.right),
+  ], title: "Results", capacity: 40),
+}
+
+state (
+  arrows = entities.arrowPool(max: 1000)
+  boxes = entities.boxPool(max: 200)
+  aSlot: int = 0
+
+  // zone memory, 50 slots per side (ring buffer)
+  inited: float = 0.0
+  bLoA = float[](50)
+  bHiA = float[](50)
+  bOnA = float[](50)
+  bArmA = float[](50)
+  bBornA = float[](50)
+  bTsA = int[](50)
+  sLoA = float[](50)
+  sHiA = float[](50)
+  sOnA = float[](50)
+  sArmA = float[](50)
+  sBornA = float[](50)
+  sTsA = int[](50)
+
+  // merged footprint rows of the current bar
+  mPr = float[](600)
+  mBuy = float[](600)
+  mSell = float[](600)
+  nextB: int = 0
+  nextS: int = 0
+
+  // counters
+  levelBars: float = 0.0
+  binSeen: float = 0.0
+  buyZones: float = 0.0
+  sellZones: float = 0.0
+  overwritten: float = 0.0
+  touchedBusy: float = 0.0
+  expired: float = 0.0
+  skipped: float = 0.0
+  rowsSum: float = 0.0
+
+  // open trade
+  dir: float = 0.0
+  entry: float = 0.0
+  stopPx: float = 0.0
+  tgtPx: float = 0.0
+  held: float = 0.0
+  entryT = time.fromUnixSeconds(0)
+  tradeSlBps: float = 0.0
+
+  // statistics
+  entries: float = 0.0
+  slSum: float = 0.0
+  trades: float = 0.0
+  wins: float = 0.0
+  targets: float = 0.0
+  stops: float = 0.0
+  timeouts: float = 0.0
+  longs: float = 0.0
+  longGross: float = 0.0
+  shorts: float = 0.0
+  shortGross: float = 0.0
+  cum: float = 0.0
+  cumGross: float = 0.0
+  cumR: float = 0.0
+  peakR: float = 0.0
+  maxDdR: float = 0.0
+  barNo: float = 0.0
+  firstPx: float = 0.0
+
+  // automatic halves
+  snapN = float[](1000)
+  snapG = float[](1000)
+  snapE = float[](1000)
+  blk: int = 0
+  midIdx: int = 0
+  flip: int = 0
+
+  // benchmark books
+  blOpen: float = 0.0
+  blEntry: float = 0.0
+  blStop: float = 0.0
+  blTgt: float = 0.0
+  blHeld: float = 0.0
+  blLast: float = -1000000.0
+  blN: float = 0.0
+  blGross: float = 0.0
+  bsOpen: float = 0.0
+  bsEntry: float = 0.0
+  bsStop: float = 0.0
+  bsTgt: float = 0.0
+  bsHeld: float = 0.0
+  bsLast: float = -1000000.0
+  bsN: float = 0.0
+  bsGross: float = 0.0
+)
+
+on chart.close {
+  let t = chart.time ?? time.fromUnixSeconds(0)
+  let tU = time.unixSeconds(t) ?? 0
+  let hi = chart.high ?? 0.0
+  let lo = chart.low ?? 0.0
+  let px = chart.close ?? 0.0
+  let gap: float? = null
+  let tfMin = math.round(time.tfSeconds(context.timeframe)) / 60.0
+  let maxBars = maxHrs * 60.0 / tfMin
+  let expireBars = expireDays * 1440.0 / tfMin
+  let everyBars = benchHrs * 60.0 / tfMin
+  barNo = barNo + 1.0
+  firstPx = firstPx > 0.0 ? firstPx : px
+  let wasFlat = dir == 0.0
+  let thru = fillThruBps / 10000.0
+  let away = awayBps / 10000.0
+
+  // Fill the 50 zone slots per side once.
+  if inited < 0.5 {
+    for k in 0..50 {
+      bLoA.push(0.0)
+      bHiA.push(0.0)
+      bOnA.push(0.0)
+      bArmA.push(0.0)
+      bBornA.push(0.0)
+      bTsA.push(0)
+      sLoA.push(0.0)
+      sHiA.push(0.0)
+      sOnA.push(0.0)
+      sArmA.push(0.0)
+      sBornA.push(0.0)
+      sTsA.push(0)
+    }
+    for q in 0..600 {
+      mPr.push(0.0)
+      mBuy.push(0.0)
+      mSell.push(0.0)
+    }
+    inited = 1.0
+  }
+
+  // 1. Walk all remembered zones: expiry, touch (uses arming from before
+  //    this bar), then arming. For a long take the HIGHEST touched buy zone
+  //    (first one price meets on the way down); for a short the LOWEST
+  //    touched sell zone. Every touched zone is used up.
+  let bFound = false
+  let bBestLo = 0.0
+  let bBestHi = 0.0
+  let sFound = false
+  let sBestLo = 0.0
+  let sBestHi = 0.0
+  for k in 0..50 {
+    let bon = bOnA[k] ?? 0.0
+    if bon > 0.5 {
+      let zl = bLoA[k] ?? 0.0
+      let zh = bHiA[k] ?? 0.0
+      let armed = bArmA[k] ?? 0.0
+      let born = bBornA[k] ?? 0.0
+      let old = expireDays > 0.0 && barNo - born > expireBars
+      let touch = !old && armed > 0.5 && lo <= zh * (1.0 - thru)
+      if old {
+        bOnA[k] = 0.0
+        expired = expired + 1.0
+      }
+      if touch {
+        bOnA[k] = 0.0
+        boxes.get("bz", k).set(
+          x1: time.fromUnixSeconds(bTsA[k] ?? 0),
+          y1: zh,
+          x2: t,
+          y2: zl,
+          color: color.withAlpha(color.green, 30),
+          borderColor: color.withAlpha(color.green, 120),
+          borderWidth: 1,
+        )
+        if !bFound || zh > bBestHi {
+          bBestHi = zh
+          bBestLo = zl
+        }
+        bFound = true
+      }
+      if !old && !touch && armed < 0.5 && px >= zh * (1.0 + away) {
+        bArmA[k] = 1.0
+      }
+    }
+    let son = sOnA[k] ?? 0.0
+    if son > 0.5 {
+      let zl2 = sLoA[k] ?? 0.0
+      let zh2 = sHiA[k] ?? 0.0
+      let armed2 = sArmA[k] ?? 0.0
+      let born2 = sBornA[k] ?? 0.0
+      let old2 = expireDays > 0.0 && barNo - born2 > expireBars
+      let touch2 = !old2 && armed2 > 0.5 && hi >= zl2 * (1.0 + thru)
+      if old2 {
+        sOnA[k] = 0.0
+        expired = expired + 1.0
+      }
+      if touch2 {
+        sOnA[k] = 0.0
+        boxes.get("sz", k).set(
+          x1: time.fromUnixSeconds(sTsA[k] ?? 0),
+          y1: zh2,
+          x2: t,
+          y2: zl2,
+          color: color.withAlpha(color.red, 30),
+          borderColor: color.withAlpha(color.red, 120),
+          borderWidth: 1,
+        )
+        if !sFound || zl2 < sBestLo {
+          sBestLo = zl2
+          sBestHi = zh2
+        }
+        sFound = true
+      }
+      if !old2 && !touch2 && armed2 < 0.5 && px <= zl2 * (1.0 - away) {
+        sArmA[k] = 1.0
+      }
+    }
+  }
+
+  // 2. Entry on the touch (limit at the zone edge). If both sides were
+  //    touched on the same bar (a huge bar), no trade.
+  let goLong = bFound && !sFound
+  let goShort = sFound && !bFound
+  touchedBusy = ((goLong || goShort) && !wasFlat) ? touchedBusy + 1.0 : touchedBusy
+  if wasFlat && (goLong || goShort) {
+    let dd = goLong ? 1.0 : -1.0
+    let fillPx = goLong ? bBestHi : sBestLo
+    let stopLevel = goLong ? bBestLo * (1.0 - bufferBps / 10000.0) : sBestHi * (1.0 + bufferBps / 10000.0)
+    let slDist = math.max(math.abs(fillPx - stopLevel), fillPx * minSlBps / 10000.0)
+    let slBps = slDist / fillPx * 10000.0
+    if slBps > maxSlBps {
+      skipped = skipped + 1.0
+    } else {
+      dir = dd
+      entry = fillPx
+      stopPx = fillPx - dd * slDist
+      tgtPx = fillPx + dd * tpR * slDist
+      held = 0.0
+      entryT = t
+      tradeSlBps = slBps
+      entries = entries + 1.0
+      slSum = slSum + slBps
+    }
+  }
+  let enteredNow = wasFlat && dir != 0.0
+
+  // 3. Manage the open trade (limit fill: only the stop on the entry bar).
+  if dir != 0.0 {
+    held = enteredNow ? held : held + 1.0
+    let hitStop = dir > 0.0 ? lo <= stopPx : hi >= stopPx
+    let hitTgt = !enteredNow && !hitStop && (dir > 0.0 ? hi >= tgtPx : lo <= tgtPx)
+    if hitStop || hitTgt || held >= maxBars {
+      let exitPx = hitStop ? stopPx : (hitTgt ? tgtPx : px)
+      let gross = (exitPx - entry) / entry * 10000.0 * dir
+      let exitFee = hitTgt ? makerBps : takerBps + slipBps
+      let pnl = gross - (makerBps + exitFee)
+      cum = cum + pnl
+      cumGross = cumGross + gross
+      cumR = cumR + pnl / tradeSlBps
+      peakR = math.max(peakR, cumR)
+      maxDdR = math.max(maxDdR, peakR - cumR)
+      trades = trades + 1.0
+      wins = pnl > 0.0 ? wins + 1.0 : wins
+      stops = hitStop ? stops + 1.0 : stops
+      targets = hitTgt ? targets + 1.0 : targets
+      timeouts = (!hitStop && !hitTgt) ? timeouts + 1.0 : timeouts
+      longs = dir > 0.0 ? longs + 1.0 : longs
+      longGross = dir > 0.0 ? longGross + gross : longGross
+      shorts = dir < 0.0 ? shorts + 1.0 : shorts
+      shortGross = dir < 0.0 ? shortGross + gross : shortGross
+      aSlot = aSlot >= 999 ? 0 : aSlot + 1
+      arrows.get("trade", aSlot).set(
+        x1: entryT,
+        y1: entry,
+        x2: t,
+        y2: exitPx,
+        color: pnl > 0.0 ? color.green : color.red,
+        width: 2,
+      )
+      dir = 0.0
+    }
+  }
+
+  // 4. Footprint of THIS bar: merge the profile levels into rows of
+  //    `rowSize` (or the profile's own bin), then find the longest stacked
+  //    imbalance per side.
+  let lvs = vol.levels(0)
+  let n = 0
+  let bin = 0.0
+  if lvs != null {
+    n = lvs.len
+    bin = lvs.binSize
+  }
+  levelBars = n > 0 ? levelBars + 1.0 : levelBars
+  binSeen = bin > 0.0 ? bin : binSeen
+  let rs = rowSize > 0.0 ? math.max(rowSize, bin) : bin
+  let m = 0
+  let lastIdx = -1000000000.0
+  if rs > 0.0 {
+    for i in 0..n {
+      let lv = vol.level(i)
+      let lp = 0.0
+      let lb = 0.0
+      let ls = 0.0
+      if lv != null {
+        lp = lv.price
+        lb = lv.buy
+        ls = lv.sell
+      }
+      let ri = math.floor(lp / rs)
+      if m > 0 && ri == lastIdx {
+        mBuy[m - 1] = (mBuy[m - 1] ?? 0.0) + lb
+        mSell[m - 1] = (mSell[m - 1] ?? 0.0) + ls
+      } else if m < 600 {
+        mPr[m] = ri * rs + rs / 2.0
+        mBuy[m] = lb
+        mSell[m] = ls
+        m = m + 1
+        lastIdx = ri
+      }
+    }
+  }
+  let runB = 0
+  let rbStart = 0.0
+  let lastB = -10
+  let bestB = 0
+  let nbLo = 0.0
+  let nbHi = 0.0
+  let runS = 0
+  let rsStart = 0.0
+  let lastS = -10
+  let bestS = 0
+  let nsLo = 0.0
+  let nsHi = 0.0
+  for j in 1..m {
+    let cPrice = mPr[j] ?? 0.0
+    let cBuy = mBuy[j] ?? 0.0
+    let pPrice = mPr[j - 1] ?? 0.0
+    let pSell = mSell[j - 1] ?? 0.0
+    let adjacent = rs > 0.0 && math.abs(cPrice - pPrice - rs) < rs * 0.5
+    let buyImb = adjacent && pSell > 0.0 && cBuy >= ratio * pSell && cBuy >= minVol
+    let sellImb = adjacent && cBuy > 0.0 && pSell >= ratio * cBuy && pSell >= minVol
+    if buyImb {
+      runB = lastB == j - 1 ? runB + 1 : 1
+      rbStart = runB == 1 ? cPrice : rbStart
+      lastB = j
+      if runB >= minRows && runB > bestB {
+        bestB = runB
+        nbLo = rbStart - rs / 2.0
+        nbHi = cPrice + rs / 2.0
+      }
+    }
+    if sellImb {
+      runS = lastS == j - 2 ? runS + 1 : 1
+      rsStart = runS == 1 ? pPrice : rsStart
+      lastS = j - 1
+      if runS >= minRows && runS > bestS {
+        bestS = runS
+        nsLo = rsStart - rs / 2.0
+        nsHi = pPrice + rs / 2.0
+      }
+    }
+  }
+
+  // 5. Store new zones (ring buffer; the oldest slot is reused).
+  if bestB >= minRows {
+    let wasOnB = bOnA[nextB] ?? 0.0
+    overwritten = wasOnB > 0.5 ? overwritten + 1.0 : overwritten
+    bLoA[nextB] = nbLo
+    bHiA[nextB] = nbHi
+    bOnA[nextB] = 1.0
+    bArmA[nextB] = 0.0
+    bBornA[nextB] = barNo
+    bTsA[nextB] = tU
+    boxes.get("bz", nextB).set(
+      x1: t,
+      y1: nbHi,
+      x2: time.fromUnixSeconds(tU + 604800),
+      y2: nbLo,
+      color: color.withAlpha(color.green, 45),
+      borderColor: color.withAlpha(color.green, 170),
+      borderWidth: 1,
+    )
+    buyZones = buyZones + 1.0
+    rowsSum = rowsSum + math.round(bestB)
+    nextB = nextB >= 49 ? 0 : nextB + 1
+  }
+  if bestS >= minRows {
+    let wasOnS = sOnA[nextS] ?? 0.0
+    overwritten = wasOnS > 0.5 ? overwritten + 1.0 : overwritten
+    sLoA[nextS] = nsLo
+    sHiA[nextS] = nsHi
+    sOnA[nextS] = 1.0
+    sArmA[nextS] = 0.0
+    sBornA[nextS] = barNo
+    sTsA[nextS] = tU
+    boxes.get("sz", nextS).set(
+      x1: t,
+      y1: nsHi,
+      x2: time.fromUnixSeconds(tU + 604800),
+      y2: nsLo,
+      color: color.withAlpha(color.red, 45),
+      borderColor: color.withAlpha(color.red, 170),
+      borderWidth: 1,
+    )
+    sellZones = sellZones + 1.0
+    rowsSum = rowsSum + math.round(bestS)
+    nextS = nextS >= 49 ? 0 : nextS + 1
+  }
+
+  // Snapshot running totals every 100 bars for the automatic halves.
+  blk = blk + 1
+  if blk >= 100 {
+    blk = 0
+    snapN.push(trades)
+    snapG.push(cumGross)
+    snapE.push(cum)
+    if flip == 1 {
+      midIdx = midIdx + 1
+    }
+    flip = 1 - flip
+  }
+
+  // 6. Benchmark books: no signal, same stop size, target multiple and hold.
+  let benchSl = benchSlBps > 0.0 ? benchSlBps : (entries > 0.0 ? slSum / entries : minSlBps)
+  if blOpen > 0.5 {
+    blHeld = blHeld + 1.0
+    let blHitStop = lo <= blStop
+    let blHitTgt = hi >= blTgt
+    if blHitStop || blHitTgt || blHeld >= maxBars {
+      let blExit = blHitStop ? blStop : (blHitTgt ? blTgt : px)
+      blGross = blGross + (blExit - blEntry) / blEntry * 10000.0
+      blN = blN + 1.0
+      blOpen = 0.0
+    }
+  }
+  if blOpen < 0.5 && barNo - blLast >= everyBars && px > 0.0 {
+    blOpen = 1.0
+    blEntry = px
+    blStop = px * (1.0 - benchSl / 10000.0)
+    blTgt = px * (1.0 + tpR * benchSl / 10000.0)
+    blHeld = 0.0
+    blLast = barNo
+  }
+  if bsOpen > 0.5 {
+    bsHeld = bsHeld + 1.0
+    let bsHitStop = hi >= bsStop
+    let bsHitTgt = lo <= bsTgt
+    if bsHitStop || bsHitTgt || bsHeld >= maxBars {
+      let bsExit = bsHitStop ? bsStop : (bsHitTgt ? bsTgt : px)
+      bsGross = bsGross + (bsEntry - bsExit) / bsEntry * 10000.0
+      bsN = bsN + 1.0
+      bsOpen = 0.0
+    }
+  }
+  if bsOpen < 0.5 && barNo - bsLast >= everyBars && px > 0.0 {
+    bsOpen = 1.0
+    bsEntry = px
+    bsStop = px * (1.0 + benchSl / 10000.0)
+    bsTgt = px * (1.0 - tpR * benchSl / 10000.0)
+    bsHeld = 0.0
+    bsLast = barNo
+  }
+
+  longIn.plot(enteredNow && dir > 0.0 ? entry : gap)
+  shortIn.plot(enteredNow && dir < 0.0 ? entry : gap)
+  equity.plot(cum)
+  grossEq.plot(cumGross)
+
+  // 7. Results table.
+  let tgtRate = trades > 0.0 ? targets / trades * 100.0 : 0.0
+  let stopRate = trades > 0.0 ? stops / trades * 100.0 : 0.0
+  let toRate = trades > 0.0 ? timeouts / trades * 100.0 : 0.0
+  let winRate = trades > 0.0 ? wins / trades * 100.0 : 0.0
+  let avgNet = trades > 0.0 ? cum / trades : 0.0
+  let avgGross = trades > 0.0 ? cumGross / trades : 0.0
+  let avgLong = longs > 0.0 ? longGross / longs : 0.0
+  let avgShort = shorts > 0.0 ? shortGross / shorts : 0.0
+  let days = barNo * tfMin / 1440.0
+  let h1n = snapN[midIdx] ?? 0.0
+  let h1Gross = snapG[midIdx] ?? 0.0
+  let h1Net = snapE[midIdx] ?? 0.0
+  let h2n = trades - h1n
+  let h1g = h1n > 0.0 ? h1Gross / h1n : 0.0
+  let h1e = h1n > 0.0 ? h1Net / h1n : 0.0
+  let h2g = h2n > 0.0 ? (cumGross - h1Gross) / h2n : 0.0
+  let h2e = h2n > 0.0 ? (cum - h1Net) / h2n : 0.0
+  let avgStop = entries > 0.0 ? slSum / entries : 0.0
+  let mkt = firstPx > 0.0 ? (px / firstPx - 1.0) * 10000.0 : 0.0
+  let bLong = blN > 0.0 ? blGross / blN : 0.0
+  let bShort = bsN > 0.0 ? bsGross / bsN : 0.0
+  let edgeLong = avgLong - bLong
+  let edgeShort = avgShort - bShort
+  let txtEdgeL = longs > 0.0 ? str.format("{0:+.1}", edgeLong) : "n/a (no longs)"
+  let txtEdgeS = shorts > 0.0 ? str.format("{0:+.1}", edgeShort) : "n/a (no shorts)"
+  let colEdgeL = longs > 0.0 ? (edgeLong >= 0.0 ? color.green : color.red) : color.gray
+  let colEdgeS = shorts > 0.0 ? (edgeShort >= 0.0 ? color.green : color.red) : color.gray
+  let txtNet = trades > 0.0 ? str.format("{0:+.1}", avgNet) : "n/a (no trades)"
+  let colNet = trades > 0.0 ? (avgNet >= 0.0 ? color.green : color.red) : color.gray
+  let perDay = days > 0.0 ? trades / days : 0.0
+  let avgR = trades > 0.0 ? cumR / trades : 0.0
+  let riskUsd = acctUsd * riskPct / 100.0
+  let notional = avgStop > 0.0 ? riskUsd / (avgStop / 10000.0) : 0.0
+  let avgCost = trades > 0.0 ? (cumGross - cum) / trades : 0.0
+  let levelPct = barNo > 0.0 ? levelBars / barNo * 100.0 : 0.0
+  let zonesAll = buyZones + sellZones
+  let avgRows = zonesAll > 0.0 ? rowsSum / zonesAll : 0.0
+
+  results.tbl.row("01", "Bars with footprint data", str.format("{0:.0}%", levelPct))
+  results.tbl.row("02", "Row size: profile bin / used", str.format("{0:.2} / {1:.2}", binSeen, rowSize > 0.0 ? math.max(rowSize, binSeen) : binSeen))
+  results.tbl.row("03", "Zones: buy / sell (avg rows)", str.format("{0:.0} / {1:.0} ({2:.1})", buyZones, sellZones, avgRows))
+  results.tbl.row("04", "Touched while in a trade / skipped / expired / overwritten", str.format("{0:.0} / {1:.0} / {2:.0} / {3:.0}", touchedBusy, skipped, expired, overwritten))
+  results.tbl.row("05", "Trades", str.format("{0:.0}", trades))
+  results.tbl.row("06", "Target / stop / timeout", str.format("{0:.0}% / {1:.0}% / {2:.0}%", tgtRate, stopRate, toRate))
+  results.tbl.row("07", "Net-positive trades", str.format("{0:.1}%", winRate))
+  results.tbl.row("08", "Avg gross / trade (bps)", str.format("{0:+.1}", avgGross))
+  results.tbl.row("09", "Avg net / trade (bps)", table.cell(txtNet, fg: colNet))
+  results.tbl.row("10", "Longs / shorts: n / avg gross", str.format("{0:.0} / {1:+.1}  |  {2:.0} / {3:+.1}", longs, avgLong, shorts, avgShort))
+  results.tbl.row("11", "Bars / days loaded", str.format("{0:.0} / {1:.1}", barNo, days))
+  results.tbl.row("12", "1st half (auto): n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", h1n, h1g, h1e))
+  results.tbl.row("13", "2nd half (auto): n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", h2n, h2g, h2e))
+  results.tbl.row("14", "Market move over window (bps)", str.format("{0:+.0}", mkt))
+  results.tbl.row("15", "Strategy avg stop / bench stop (bps)", str.format("{0:.1} / {1:.1}", avgStop, benchSl))
+  results.tbl.row("16", "Bench longs / shorts: avg gross", str.format("{0:+.1} (n {1:.0})  |  {2:+.1} (n {3:.0})", bLong, blN, bShort, bsN))
+  results.tbl.row("17", "Longs vs bench (bps/trade)", table.cell(txtEdgeL, fg: colEdgeL))
+  results.tbl.row("18", "Shorts vs bench (bps/trade)", table.cell(txtEdgeS, fg: colEdgeS))
+  results.tbl.row("19", "Trades per day / per week", str.format("{0:.2} / {1:.1}", perDay, perDay * 7.0))
+  results.tbl.row("20", "Avg net in R / total R / max DD R", str.format("{0:+.2} / {1:+.1} / {2:.1}", avgR, cumR, maxDdR))
+  results.tbl.row("21", "Risk $ per trade / avg position size $", str.format("{0:.0} / {1:.0}", riskUsd, notional))
+  results.tbl.row("22", "Avg $ / total $ / max drawdown $", str.format("{0:+.0} / {1:+.0} / {2:.0}", avgR * riskUsd, cumR * riskUsd, maxDdR * riskUsd))
+  results.tbl.row("23", "Avg cost / trade (bps)", str.format("{0:.1}", avgCost))
+  results.tbl.row("24", "Position now", dir > 0.0 ? "long" : (dir < 0.0 ? "short" : "flat"))
+}

@@ -8,3 +8,6 @@ pipeline/
 .git/
 *.ipynb
 _bq_backfill_ticker.py
+model/
+research/
+docs/

@@ -1,0 +1,493 @@
+script "Volume Backtester v5.1 - Trapped Traders (Matthias & Claude)"
+
+// Setup (Michael's read): an aggressive move on heavy volume puts one side in.
+// If price then comes back through their entry area and CVD turns the other
+// way, they are underwater and have to cover -> trade against them.
+//   1. Trap bar: volume > k x average. Delta sign says who was aggressive:
+//      negative delta = sellers -> LONG setup; positive = buyers -> SHORT setup.
+//   2. Trapped: a close back past the trap bar (mid or far end, see input).
+//   3. CVD turn: CVD has recovered at least `cvdTurn` x the trap bar's delta
+//      from its extreme since the trap bar.
+//   4. Entry at the close of the bar where 2 and 3 are both true.
+//      Stop beyond the extreme since the trap bar (the flush), target
+//      tpR x stop, max hold. Setups with a stop wider than `maxSlBps` are
+//      skipped (prop-firm risk control).
+// Also: signal-free benchmark, halves, OI tag (new positions vs closing),
+// and a PROP-FIRM panel in R (1R = one stop) with a challenge simulation.
+// Conservative fills: managed from the bar after entry, stop before target.
+// v5.1: chart timeframe and the half-split are automatic (no inputs to set).
+// Halves = everything loaded, cut at the middle in time (to within 100 bars).
+
+data chart = subscribe(data.ohlcv, history: 20000)
+data vd = subscribe(data.vd, history: 20000)
+data oi = subscribe(data.oi, history: 20000)
+
+input (
+  volLen     = input.int(60, title: "Volume Avg Length (bars)", min: 5, max: 500)
+  volMult    = input.float(4.0, title: "Trap bar: heavy volume (x avg)", min: 1.0, max: 50.0)
+  minShare   = input.float(0.0, title: "Trap bar: min |delta| / volume (0-1)", min: 0.0, max: 1.0)
+  reclaim    = input.int(0, title: "Trapped when close past: 0 = bar mid, 1 = far end", min: 0, max: 1)
+  cvdTurn    = input.float(0.5, title: "CVD turn (x trap bar delta)", min: 0.0, max: 10.0)
+  expireHrs  = input.float(4.0, title: "Setup expiry (hours)", min: 0.1, max: 168.0)
+  bufferBps  = input.float(5.0, title: "Stop buffer beyond extreme (bps)", min: 0.0, max: 200.0)
+  minSlBps   = input.float(25.0, title: "Min stop distance (bps)", min: 1.0, max: 500.0)
+  maxSlBps   = input.float(150.0, title: "Max stop distance (bps) - wider = skip", min: 5.0, max: 2000.0)
+  tpR        = input.float(1.5, title: "Target (x stop distance)", min: 0.2, max: 20.0)
+  maxHrs     = input.float(4.0, title: "Max time in trade (hours)", min: 0.1, max: 168.0)
+  costBps    = input.float(11.0, title: "Round-trip Cost (bps)", min: 0.0, max: 100.0)
+  benchHrs   = input.float(1.0, title: "Benchmark: new entry every (hours)", min: 0.1, max: 168.0)
+  benchSlBps = input.float(0.0, title: "Benchmark stop (bps, 0 = strategy avg)", min: 0.0, max: 2000.0)
+  acctUsd    = input.float(100000.0, title: "Prop: account size ($)", min: 1000.0, max: 10000000.0)
+  riskPct    = input.float(0.5, title: "Prop: risk per trade (% of account)", min: 0.05, max: 5.0)
+  dayLimPct  = input.float(1.5, title: "Prop: max loss per day (%)", min: 0.1, max: 20.0)
+  maxLossPct = input.float(5.0, title: "Prop: max loss from start (%)", min: 0.5, max: 50.0)
+  targetPct  = input.float(10.0, title: "Prop: profit target (%)", min: 0.5, max: 100.0)
+)
+
+pane eqPane = pane(title: "Cumulative PnL (bps): net, gross in grey", height: 0.25)
+
+plot (
+  equity  = plot.line(title: "Cum Net PnL (bps)", on: eqPane, width: 2)
+  grossEq = plot.line(title: "Cum Gross PnL (bps)", on: eqPane, color: color.gray, width: 1)
+  longIn  = plot.marker(title: "Long entry", shape: shape.up, color: color.green, size: 10)
+  shortIn = plot.marker(title: "Short entry", shape: shape.down, color: color.red, size: 10)
+  oiMark  = plot.marker(title: "OI rose on trap bar", shape: shape.circle, color: color.yellow, size: 6)
+)
+
+window results = window(title: "Trapped Traders v5.1") {
+  tbl: table.new([
+    table.col(title: "Metric"),
+    table.col(title: "Value", align: align.right),
+  ], title: "Results", capacity: 40),
+}
+
+state (
+  arrows = entities.arrowPool(max: 1000)
+  boxes = entities.boxPool(max: 1000)
+  aSlot: int = 0
+  bSlot: int = 0
+
+  // flow
+  cvd: float = 0.0
+  oiPrev: float = 0.0
+  oiSeen: float = 0.0
+
+  // setup: 1 = long setup (sellers trapped), -1 = short setup (buyers trapped)
+  sState: float = 0.0
+  sHi: float = 0.0
+  sLo: float = 0.0
+  sT = time.fromUnixSeconds(0)
+  sAge: float = 0.0
+  sExt: float = 0.0
+  cvdExt: float = 0.0
+  sDeltaAbs: float = 0.0
+  sOiUp: float = 0.0
+
+  // open trade
+  dir: float = 0.0
+  entry: float = 0.0
+  stopPx: float = 0.0
+  tgtPx: float = 0.0
+  held: float = 0.0
+  entryT = time.fromUnixSeconds(0)
+  tradeSlBps: float = 0.0
+  tradeOiUp: float = 0.0
+
+  // strategy statistics
+  sellTraps: float = 0.0
+  buyTraps: float = 0.0
+  shareSum: float = 0.0
+  skipped: float = 0.0
+  entries: float = 0.0
+  slSum: float = 0.0
+  trades: float = 0.0
+  wins: float = 0.0
+  targets: float = 0.0
+  stops: float = 0.0
+  timeouts: float = 0.0
+  longs: float = 0.0
+  longGross: float = 0.0
+  shorts: float = 0.0
+  shortGross: float = 0.0
+  cum: float = 0.0
+  cumGross: float = 0.0
+  barNo: float = 0.0
+  firstPx: float = 0.0
+  // snapshots of the running totals every 100 bars -> automatic halves
+  snapN = float[](1000)
+  snapG = float[](1000)
+  snapE = float[](1000)
+  blk: int = 0
+  midIdx: int = 0
+  flip: int = 0
+  ouN: float = 0.0
+  ouGross: float = 0.0
+  ouNet: float = 0.0
+  onN: float = 0.0
+  onGross: float = 0.0
+  onNet: float = 0.0
+
+  // prop-firm view (R = net result / stop distance)
+  cumR: float = 0.0
+  peakR: float = 0.0
+  maxDdR: float = 0.0
+  dayBar: float = 0.0
+  dayR: float = 0.0
+  worstDayR: float = 0.0
+  streak: float = 0.0
+  maxStreak: float = 0.0
+  challenge: float = 0.0
+  challengeBar: float = 0.0
+
+  // benchmark long book
+  blOpen: float = 0.0
+  blEntry: float = 0.0
+  blStop: float = 0.0
+  blTgt: float = 0.0
+  blHeld: float = 0.0
+  blLast: float = -1000000.0
+  blN: float = 0.0
+  blGross: float = 0.0
+
+  // benchmark short book
+  bsOpen: float = 0.0
+  bsEntry: float = 0.0
+  bsStop: float = 0.0
+  bsTgt: float = 0.0
+  bsHeld: float = 0.0
+  bsLast: float = -1000000.0
+  bsN: float = 0.0
+  bsGross: float = 0.0
+)
+
+on chart.close {
+  // Series functions are called on every bar, before any branching.
+  let avgVol = ta.sma(chart.volume, volLen)
+
+  let t = chart.time ?? time.fromUnixSeconds(0)
+  let hi = chart.high ?? 0.0
+  let lo = chart.low ?? 0.0
+  let px = chart.close ?? 0.0
+  let vol = chart.volume ?? 0.0
+  let delta = vd.close ?? 0.0
+  let oiNow = oi.close ?? 0.0
+  let gap: float? = null
+  let wasFlat = dir == 0.0
+  let tfMin = math.round(time.tfSeconds(context.timeframe)) / 60.0
+  let expireBars = expireHrs * 60.0 / tfMin
+  let maxBars = maxHrs * 60.0 / tfMin
+  let everyBars = benchHrs * 60.0 / tfMin
+  let barsPerDay = 1440.0 / tfMin
+  barNo = barNo + 1.0
+  firstPx = firstPx > 0.0 ? firstPx : px
+  cvd = cvd + delta
+  oiSeen = oiNow > 0.0 ? 1.0 : oiSeen
+
+  // Daily blocks of 24 h counted from the first bar (approximation of the
+  // prop firm's daily reset).
+  dayBar = dayBar + 1.0
+  if dayBar > barsPerDay {
+    dayBar = 1.0
+    dayR = 0.0
+  }
+
+  // 1. Setup lifecycle: age, expiry, extremes since the trap bar.
+  if sState != 0.0 {
+    sAge = sAge + 1.0
+    if sAge > expireBars {
+      sState = 0.0
+    }
+  }
+  if sState > 0.5 {
+    sExt = math.min(sExt, lo)
+    cvdExt = math.min(cvdExt, cvd)
+  }
+  if sState < -0.5 {
+    sExt = math.max(sExt, hi)
+    cvdExt = math.max(cvdExt, cvd)
+  }
+
+  // 2. Entry at this close when the trapped side is underwater and CVD turned.
+  let mid = (sHi + sLo) / 2.0
+  let longLevel = reclaim == 0 ? mid : sHi
+  let shortLevel = reclaim == 0 ? mid : sLo
+  let longSig = sState > 0.5 && sAge >= 1.0 && px > longLevel && cvd - cvdExt >= cvdTurn * sDeltaAbs
+  let shortSig = sState < -0.5 && sAge >= 1.0 && px < shortLevel && cvdExt - cvd >= cvdTurn * sDeltaAbs
+  if wasFlat && (longSig || shortSig) && px > 0.0 {
+    let d = longSig ? 1.0 : -1.0
+    let stopLevel = longSig ? sExt * (1.0 - bufferBps / 10000.0) : sExt * (1.0 + bufferBps / 10000.0)
+    let slDist = math.max(math.abs(px - stopLevel), px * minSlBps / 10000.0)
+    let slBps = slDist / px * 10000.0
+    if slBps > maxSlBps {
+      skipped = skipped + 1.0
+    } else {
+      dir = d
+      entry = px
+      stopPx = px - d * slDist
+      tgtPx = px + d * tpR * slDist
+      held = 0.0
+      entryT = t
+      tradeSlBps = slBps
+      tradeOiUp = sOiUp
+      entries = entries + 1.0
+      slSum = slSum + slBps
+    }
+    sState = 0.0
+  }
+  let enteredNow = wasFlat && dir != 0.0
+
+  // 3. Manage the open trade from the bar after entry; stop before target.
+  if dir != 0.0 && !enteredNow {
+    held = held + 1.0
+    let hitStop = dir > 0.0 ? lo <= stopPx : hi >= stopPx
+    let hitTgt = dir > 0.0 ? hi >= tgtPx : lo <= tgtPx
+    if hitStop || hitTgt || held >= maxBars {
+      let exitPx = hitStop ? stopPx : (hitTgt ? tgtPx : px)
+      let gross = (exitPx - entry) / entry * 10000.0 * dir
+      let pnl = gross - costBps
+      let r = pnl / tradeSlBps
+      cum = cum + pnl
+      cumGross = cumGross + gross
+      trades = trades + 1.0
+      wins = pnl > 0.0 ? wins + 1.0 : wins
+      stops = hitStop ? stops + 1.0 : stops
+      targets = (!hitStop && hitTgt) ? targets + 1.0 : targets
+      timeouts = (!hitStop && !hitTgt) ? timeouts + 1.0 : timeouts
+      longs = dir > 0.0 ? longs + 1.0 : longs
+      longGross = dir > 0.0 ? longGross + gross : longGross
+      shorts = dir < 0.0 ? shorts + 1.0 : shorts
+      shortGross = dir < 0.0 ? shortGross + gross : shortGross
+      let oiUp = tradeOiUp > 0.5
+      ouN = oiUp ? ouN + 1.0 : ouN
+      ouGross = oiUp ? ouGross + gross : ouGross
+      ouNet = oiUp ? ouNet + pnl : ouNet
+      onN = oiUp ? onN : onN + 1.0
+      onGross = oiUp ? onGross : onGross + gross
+      onNet = oiUp ? onNet : onNet + pnl
+
+      // Prop-firm view.
+      cumR = cumR + r
+      peakR = math.max(peakR, cumR)
+      maxDdR = math.max(maxDdR, peakR - cumR)
+      dayR = dayR + r
+      worstDayR = math.min(worstDayR, dayR)
+      streak = pnl < 0.0 ? streak + 1.0 : 0.0
+      maxStreak = math.max(maxStreak, streak)
+      if challenge == 0.0 {
+        if cumR * riskPct <= -maxLossPct {
+          challenge = -1.0
+          challengeBar = barNo
+        } else if dayR * riskPct <= -dayLimPct {
+          challenge = -2.0
+          challengeBar = barNo
+        } else if cumR * riskPct >= targetPct {
+          challenge = 1.0
+          challengeBar = barNo
+        }
+      }
+
+      // One arrow per trade: entry -> exit, green if net profit, red if not.
+      aSlot = aSlot >= 999 ? 0 : aSlot + 1
+      arrows.get("trade", aSlot).set(
+        x1: entryT,
+        y1: entry,
+        x2: t,
+        y2: exitPx,
+        color: pnl > 0.0 ? color.green : color.red,
+        width: 2,
+      )
+      dir = 0.0
+    }
+  }
+
+  // 4. Benchmark books: no signal, same stop size, target multiple and hold.
+  let benchSl = benchSlBps > 0.0 ? benchSlBps : (entries > 0.0 ? slSum / entries : minSlBps)
+
+  if blOpen > 0.5 {
+    blHeld = blHeld + 1.0
+    let blHitStop = lo <= blStop
+    let blHitTgt = hi >= blTgt
+    if blHitStop || blHitTgt || blHeld >= maxBars {
+      let blExit = blHitStop ? blStop : (blHitTgt ? blTgt : px)
+      blGross = blGross + (blExit - blEntry) / blEntry * 10000.0
+      blN = blN + 1.0
+      blOpen = 0.0
+    }
+  }
+  if blOpen < 0.5 && barNo - blLast >= everyBars && px > 0.0 {
+    blOpen = 1.0
+    blEntry = px
+    blStop = px * (1.0 - benchSl / 10000.0)
+    blTgt = px * (1.0 + tpR * benchSl / 10000.0)
+    blHeld = 0.0
+    blLast = barNo
+  }
+
+  if bsOpen > 0.5 {
+    bsHeld = bsHeld + 1.0
+    let bsHitStop = hi >= bsStop
+    let bsHitTgt = lo <= bsTgt
+    if bsHitStop || bsHitTgt || bsHeld >= maxBars {
+      let bsExit = bsHitStop ? bsStop : (bsHitTgt ? bsTgt : px)
+      bsGross = bsGross + (bsEntry - bsExit) / bsEntry * 10000.0
+      bsN = bsN + 1.0
+      bsOpen = 0.0
+    }
+  }
+  if bsOpen < 0.5 && barNo - bsLast >= everyBars && px > 0.0 {
+    bsOpen = 1.0
+    bsEntry = px
+    bsStop = px * (1.0 + benchSl / 10000.0)
+    bsTgt = px * (1.0 - tpR * benchSl / 10000.0)
+    bsHeld = 0.0
+    bsLast = barNo
+  }
+
+  // Snapshot the running totals every 100 bars. midIdx follows the middle
+  // snapshot, so "1st half" = totals at the middle of everything loaded.
+  blk = blk + 1
+  if blk >= 100 {
+    blk = 0
+    snapN.push(trades)
+    snapG.push(cumGross)
+    snapE.push(cum)
+    if flip == 1 {
+      midIdx = midIdx + 1
+    }
+    flip = 1 - flip
+  }
+
+  // 5. New trap bar (replaces any unused setup).
+  let heavy = avgVol != null && vol > (avgVol ?? 0.0) * volMult
+  let share = vol > 0.0 ? math.abs(delta) / vol : 0.0
+  let oiRose = oiPrev > 0.0 && oiNow > oiPrev
+  if heavy && delta != 0.0 && share >= minShare {
+    sState = delta < 0.0 ? 1.0 : -1.0
+    sHi = hi
+    sLo = lo
+    sT = t
+    sAge = 0.0
+    sExt = delta < 0.0 ? lo : hi
+    cvdExt = cvd
+    sDeltaAbs = math.abs(delta)
+    sOiUp = oiRose ? 1.0 : 0.0
+    sellTraps = delta < 0.0 ? sellTraps + 1.0 : sellTraps
+    buyTraps = delta > 0.0 ? buyTraps + 1.0 : buyTraps
+    shareSum = shareSum + share
+    bSlot = bSlot >= 999 ? 0 : bSlot + 1
+  }
+  oiPrev = oiNow > 0.0 ? oiNow : oiPrev
+
+  // Trap bar box: red = sellers aggressive (long setup), green = buyers.
+  if sState != 0.0 {
+    boxes.get("trap", bSlot).set(
+      x1: sT,
+      y1: sHi,
+      x2: t,
+      y2: sLo,
+      color: sState > 0.5 ? color.withAlpha(color.red, 40) : color.withAlpha(color.green, 40),
+      borderColor: sState > 0.5 ? color.withAlpha(color.red, 150) : color.withAlpha(color.green, 150),
+      borderWidth: 1,
+    )
+  }
+
+  longIn.plot(enteredNow && dir > 0.0 ? entry : gap)
+  shortIn.plot(enteredNow && dir < 0.0 ? entry : gap)
+  oiMark.plot(enteredNow && tradeOiUp > 0.5 ? entry : gap)
+  equity.plot(cum)
+  grossEq.plot(cumGross)
+
+  // 6. Results table.
+  let traps = sellTraps + buyTraps
+  let tgtRate = trades > 0.0 ? targets / trades * 100.0 : 0.0
+  let stopRate = trades > 0.0 ? stops / trades * 100.0 : 0.0
+  let toRate = trades > 0.0 ? timeouts / trades * 100.0 : 0.0
+  let winRate = trades > 0.0 ? wins / trades * 100.0 : 0.0
+  let avgNet = trades > 0.0 ? cum / trades : 0.0
+  let avgGross = trades > 0.0 ? cumGross / trades : 0.0
+  let avgLong = longs > 0.0 ? longGross / longs : 0.0
+  let avgShort = shorts > 0.0 ? shortGross / shorts : 0.0
+  let days = barNo * tfMin / 1440.0
+  let h1n = snapN[midIdx] ?? 0.0
+  let h1Gross = snapG[midIdx] ?? 0.0
+  let h1Net = snapE[midIdx] ?? 0.0
+  let h2n = trades - h1n
+  let h2Gross = cumGross - h1Gross
+  let h2Net = cum - h1Net
+  let h1g = h1n > 0.0 ? h1Gross / h1n : 0.0
+  let h1e = h1n > 0.0 ? h1Net / h1n : 0.0
+  let h2g = h2n > 0.0 ? h2Gross / h2n : 0.0
+  let h2e = h2n > 0.0 ? h2Net / h2n : 0.0
+  let avgStop = entries > 0.0 ? slSum / entries : 0.0
+  let mkt = firstPx > 0.0 ? (px / firstPx - 1.0) * 10000.0 : 0.0
+  let bLong = blN > 0.0 ? blGross / blN : 0.0
+  let bShort = bsN > 0.0 ? bsGross / bsN : 0.0
+  let edgeLong = avgLong - bLong
+  let edgeShort = avgShort - bShort
+  let ouG = ouN > 0.0 ? ouGross / ouN : 0.0
+  let ouE = ouN > 0.0 ? ouNet / ouN : 0.0
+  let onG = onN > 0.0 ? onGross / onN : 0.0
+  let onE = onN > 0.0 ? onNet / onN : 0.0
+  let avgShare = traps > 0.0 ? shareSum / traps : 0.0
+
+  results.tbl.row("01", "Traps: sellers / buyers aggressive", str.format("{0:.0} / {1:.0}", sellTraps, buyTraps))
+  results.tbl.row("02", "Skipped (stop too wide)", str.format("{0:.0}", skipped))
+  results.tbl.row("03", "Trades", str.format("{0:.0}", trades))
+  results.tbl.row("04", "Target / stop / timeout", str.format("{0:.0}% / {1:.0}% / {2:.0}%", tgtRate, stopRate, toRate))
+  results.tbl.row("05", "Net-positive trades", str.format("{0:.1}%", winRate))
+  results.tbl.row("06", "Avg gross / trade (bps)", str.format("{0:+.1}", avgGross))
+  results.tbl.row("07", "Avg net / trade (bps)",
+    table.cell(trades > 0.0 ? str.format("{0:+.1}", avgNet) : "n/a (no trades)", fg: trades > 0.0 ? (avgNet >= 0.0 ? color.green : color.red) : color.gray))
+  results.tbl.row("08", "Longs / shorts: n / avg gross", str.format("{0:.0} / {1:+.1}  |  {2:.0} / {3:+.1}", longs, avgLong, shorts, avgShort))
+  results.tbl.row("09", "Bars / days loaded", str.format("{0:.0} / {1:.1}", barNo, days))
+  results.tbl.row("10", "1st half (auto): n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", h1n, h1g, h1e))
+  results.tbl.row("11", "2nd half (auto): n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", h2n, h2g, h2e))
+  results.tbl.row("12", "Market move over window (bps)", str.format("{0:+.0}", mkt))
+  results.tbl.row("13", "Strategy avg stop / bench stop (bps)", str.format("{0:.1} / {1:.1}", avgStop, benchSl))
+  results.tbl.row("14", "Bench longs / shorts: avg gross", str.format("{0:+.1} (n {1:.0})  |  {2:+.1} (n {3:.0})", bLong, blN, bShort, bsN))
+  let txtEdgeL = longs > 0.0 ? str.format("{0:+.1}", edgeLong) : "n/a (no longs)"
+  let txtEdgeS = shorts > 0.0 ? str.format("{0:+.1}", edgeShort) : "n/a (no shorts)"
+  let colEdgeL = longs > 0.0 ? (edgeLong >= 0.0 ? color.green : color.red) : color.gray
+  let colEdgeS = shorts > 0.0 ? (edgeShort >= 0.0 ? color.green : color.red) : color.gray
+  results.tbl.row("15", "Longs vs bench (bps/trade)", table.cell(txtEdgeL, fg: colEdgeL))
+  results.tbl.row("16", "Shorts vs bench (bps/trade)", table.cell(txtEdgeS, fg: colEdgeS))
+  results.tbl.row("17", "OI rose on trap bar: n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", ouN, ouG, ouE))
+  results.tbl.row("18", "OI did not rise: n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", onN, onG, onE))
+  results.tbl.row("19", "OI data on this chart", oiSeen > 0.5 ? "yes" : "missing (use a perp chart)")
+  results.tbl.row("20", "Avg |delta| / volume on trap bars", str.format("{0:.2}", avgShare))
+
+  // Prop-firm panel.
+  let avgR = trades > 0.0 ? cumR / trades : 0.0
+  let ddPct = maxDdR * riskPct
+  let dayPct = -worstDayR * riskPct
+  let ddRisk = maxDdR > 0.0 ? maxLossPct / maxDdR : 99.0
+  let dayRisk = worstDayR < 0.0 ? dayLimPct / (-worstDayR) : 99.0
+  let safeRisk = math.min(ddRisk, dayRisk)
+  let chDays = challengeBar * tfMin / 1440.0
+  let nowPct = cumR * riskPct
+  results.tbl.row("21", "PROP: avg R / trade (net)",
+    table.cell(str.format("{0:+.2}", avgR), fg: avgR >= 0.0 ? color.green : color.red))
+  results.tbl.row("22", "PROP: total R / max DD R / losing streak", str.format("{0:+.1} / {1:.1} / {2:.0}", cumR, maxDdR, maxStreak))
+  results.tbl.row("23", "PROP: worst day (R)", str.format("{0:.1}", worstDayR))
+  results.tbl.row("24", "PROP: at risk/trade -> max DD % | worst day %",
+    table.cell(str.format("{0:.2}% -> {1:.1}% | {2:.1}%", riskPct, ddPct, dayPct),
+      fg: (ddPct < maxLossPct && dayPct < dayLimPct) ? color.green : color.red))
+  results.tbl.row("25", "PROP: highest risk/trade history survived", str.format("{0:.2}% (use half)", safeRisk))
+  let txtPass = str.format("PASSED on day {0:.1}", chDays)
+  let txtDay = str.format("FAILED daily limit, day {0:.1}", chDays)
+  let txtMax = str.format("FAILED max loss, day {0:.1}", chDays)
+  let txtRun = str.format("running: {0:+.1}%", nowPct)
+  let txtFail = challenge < -1.5 ? txtDay : txtMax
+  let txtOpen = challenge < -0.5 ? txtFail : txtRun
+  let chText = challenge > 0.5 ? txtPass : txtOpen
+  results.tbl.row("26", "PROP: challenge from chart start", chText)
+  let perDay = days > 0.0 ? trades / days : 0.0
+  let riskUsd = acctUsd * riskPct / 100.0
+  let notional = avgStop > 0.0 ? riskUsd / (avgStop / 10000.0) : 0.0
+  results.tbl.row("28", "Trades per day / per week", str.format("{0:.2} / {1:.1}", perDay, perDay * 7.0))
+  results.tbl.row("29", "PROP: risk $ / avg position size $", str.format("{0:.0} / {1:.0}", riskUsd, notional))
+  results.tbl.row("30", "PROP: avg $ per trade (net)",
+    table.cell(str.format("{0:+.0}", avgR * riskUsd), fg: avgR >= 0.0 ? color.green : color.red))
+  results.tbl.row("31", "PROP: total $ / max drawdown $", str.format("{0:+.0} / {1:.0}", cumR * riskUsd, maxDdR * riskUsd))
+  results.tbl.row("27", "Position now", dir > 0.0 ? "long" : (dir < 0.0 ? "short" : "flat"))
+}

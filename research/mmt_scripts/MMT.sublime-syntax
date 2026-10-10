@@ -1,0 +1,67 @@
+%YAML 1.2
+---
+# Syntax highlighting for MMT Scripting v3 (.mmt) in Sublime Text.
+# Install: Sublime Text -> Preferences -> Browse Packages... -> open "User"
+# -> put this file there. Open any .mmt file; bottom right should say "MMT".
+name: MMT
+file_extensions:
+  - mmt
+scope: source.mmt
+
+contexts:
+  main:
+    - match: '//.*$'
+      scope: comment.line.double-slash.mmt
+
+    - match: '"'
+      scope: punctuation.definition.string.begin.mmt
+      push: string
+
+    # block declarations
+    - match: '\b(script|data|input|pane|plot|window|state|on)\b'
+      scope: keyword.declaration.mmt
+
+    # control flow and bindings
+    - match: '\b(let|if|else|for|in|while|return|fn|match|break|continue)\b'
+      scope: keyword.control.mmt
+
+    - match: '\b(true|false|null)\b'
+      scope: constant.language.mmt
+
+    # types
+    - match: '\b(int|float|bool|string|time|timeframe|duration|color)\b(?=\s*[\?\)\],=]|\s*$|\[)'
+      scope: storage.type.mmt
+
+    # built-in namespaces (ta.sma, math.max, str.format, color.green, ...)
+    - match: '\b(ta|math|str|color|time|table|entities|shape|align|context|input|plot|data)\b(?=\.)'
+      scope: support.module.mmt
+
+    # event handlers: on chart.close / chart.update
+    - match: '\.(close|update)\b(?=\s*\{)'
+      scope: entity.name.function.event.mmt
+
+    # function / method calls
+    - match: '\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()'
+      scope: variable.function.mmt
+
+    # named arguments  (title:, min:, color: ...)
+    - match: '\b([A-Za-z_][A-Za-z0-9_]*)\s*(:)(?!:)'
+      captures:
+        1: variable.parameter.mmt
+        2: punctuation.separator.mmt
+
+    - match: '\b[0-9]+(\.[0-9]+)?\b'
+      scope: constant.numeric.mmt
+
+    - match: '\?\?|==|!=|<=|>=|&&|\|\||[-+*/%<>!?=]'
+      scope: keyword.operator.mmt
+
+  string:
+    - meta_scope: string.quoted.double.mmt
+    - match: '\{[0-9]+(:[^}]*)?\}'
+      scope: constant.other.placeholder.mmt
+    - match: '\\.'
+      scope: constant.character.escape.mmt
+    - match: '"'
+      scope: punctuation.definition.string.end.mmt
+      pop: true

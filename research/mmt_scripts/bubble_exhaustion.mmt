@@ -1,0 +1,363 @@
+script "Bubble Exhaustion v7 (Matthias & Claude)"
+
+// Idea from Michael's template: big volume-delta bubbles at the END of a move
+// mark exhaustion. Aggressive buyers hit a fresh high, get absorbed by
+// passive sellers, and price turns. Trade AGAINST the bubble (fade).
+//   1. Bubble: this bar's volume delta > bubMult x its running average |delta|.
+//      Use an AGGREGATED chart (e.g. "Futures, 7 venues" like Michael) - the
+//      script reads the chart's own delta.
+//   2. Location: a BUY bubble only counts at a fresh `swingLen`-bar high,
+//      a SELL bubble only at a fresh `swingLen`-bar low (0 = anywhere).
+//   3. Confirmation (fade): the next bar must NOT extend beyond the bubble's
+//      extreme -> enter at that bar's close. If it extends, the setup is void.
+//      With confirm = 0 the entry is the bubble bar's close.
+//   4. Stop beyond the bubble extreme (+buffer, min distance; wider than
+//      maxSlBps = skip), target tpR x stop, max hold. Market entry (taker).
+// Mode 1 = follow the bubble instead (immediate entry, stop beyond the
+// bubble's other end) - for comparison.
+// Benchmark, automatic halves, R / $ rows, fees by order type as in v4.3.
+
+data chart = subscribe(data.ohlcv, history: 20000)
+data vd = subscribe(data.vd, history: 20000)
+
+input (
+  bubLen     = input.int(60, title: "Bubble: average length (bars)", min: 5, max: 500)
+  bubMult    = input.float(4.0, title: "Bubble: |delta| > x average", min: 1.0, max: 50.0)
+  swingLen   = input.int(20, title: "Location: fresh high/low of N bars (0 = anywhere)", min: 0, max: 500)
+  mode       = input.int(0, title: "Mode: 0 = fade bubble, 1 = follow bubble", min: 0, max: 1)
+  confirm    = input.int(1, title: "Fade confirm: next bar must not extend (1 = yes)", min: 0, max: 1)
+  bufferBps  = input.float(5.0, title: "Stop buffer beyond bubble (bps)", min: 0.0, max: 200.0)
+  minSlBps   = input.float(25.0, title: "Min stop distance (bps)", min: 1.0, max: 500.0)
+  maxSlBps   = input.float(300.0, title: "Max stop distance (bps) - wider = skip", min: 5.0, max: 3000.0)
+  tpR        = input.float(1.5, title: "Target (x stop distance)", min: 0.2, max: 20.0)
+  maxHrs     = input.float(4.0, title: "Max time in trade (hours)", min: 0.1, max: 168.0)
+  makerBps   = input.float(2.0, title: "Fee maker, per side (bps)", min: 0.0, max: 50.0)
+  takerBps   = input.float(5.5, title: "Fee taker, per side (bps)", min: 0.0, max: 50.0)
+  slipBps    = input.float(1.0, title: "Slippage on market orders (bps)", min: 0.0, max: 50.0)
+  benchHrs   = input.float(1.0, title: "Benchmark: new entry every (hours)", min: 0.1, max: 168.0)
+  benchSlBps = input.float(0.0, title: "Benchmark stop (bps, 0 = strategy avg)", min: 0.0, max: 3000.0)
+  acctUsd    = input.float(100000.0, title: "Account size ($)", min: 1000.0, max: 10000000.0)
+  riskPct    = input.float(0.5, title: "Risk per trade (% of account)", min: 0.05, max: 5.0)
+)
+
+pane eqPane = pane(title: "Cumulative PnL (bps): net, gross in grey", height: 0.25)
+
+plot (
+  equity  = plot.line(title: "Cum Net PnL (bps)", on: eqPane, width: 2)
+  grossEq = plot.line(title: "Cum Gross PnL (bps)", on: eqPane, color: color.gray, width: 1)
+  longIn  = plot.marker(title: "Long entry", shape: shape.up, color: color.green, size: 10)
+  shortIn = plot.marker(title: "Short entry", shape: shape.down, color: color.red, size: 10)
+  buyBubM = plot.marker(title: "Buy bubble at high", shape: shape.circle, color: color.green, size: 7)
+  sellBubM = plot.marker(title: "Sell bubble at low", shape: shape.circle, color: color.red, size: 7)
+)
+
+window results = window(title: "Bubble Exhaustion v7") {
+  tbl: table.new([
+    table.col(title: "Metric"),
+    table.col(title: "Value", align: align.right),
+  ], title: "Results", capacity: 40),
+}
+
+state (
+  arrows = entities.arrowPool(max: 1000)
+  aSlot: int = 0
+
+  emaAbs: float = 0.0
+  buyBubs: float = 0.0
+  sellBubs: float = 0.0
+  voided: float = 0.0
+  skipped: float = 0.0
+
+  // pending fade setup waiting for confirmation
+  pDir: float = 0.0
+  pHi: float = 0.0
+  pLo: float = 0.0
+
+  // open trade
+  dir: float = 0.0
+  entry: float = 0.0
+  stopPx: float = 0.0
+  tgtPx: float = 0.0
+  held: float = 0.0
+  entryT = time.fromUnixSeconds(0)
+  tradeSlBps: float = 0.0
+
+  // statistics
+  entries: float = 0.0
+  slSum: float = 0.0
+  trades: float = 0.0
+  wins: float = 0.0
+  targets: float = 0.0
+  stops: float = 0.0
+  timeouts: float = 0.0
+  longs: float = 0.0
+  longGross: float = 0.0
+  shorts: float = 0.0
+  shortGross: float = 0.0
+  cum: float = 0.0
+  cumGross: float = 0.0
+  cumR: float = 0.0
+  peakR: float = 0.0
+  maxDdR: float = 0.0
+  barNo: float = 0.0
+  firstPx: float = 0.0
+
+  // automatic halves
+  snapN = float[](1000)
+  snapG = float[](1000)
+  snapE = float[](1000)
+  blk: int = 0
+  midIdx: int = 0
+  flip: int = 0
+
+  // benchmark books
+  blOpen: float = 0.0
+  blEntry: float = 0.0
+  blStop: float = 0.0
+  blTgt: float = 0.0
+  blHeld: float = 0.0
+  blLast: float = -1000000.0
+  blN: float = 0.0
+  blGross: float = 0.0
+  bsOpen: float = 0.0
+  bsEntry: float = 0.0
+  bsStop: float = 0.0
+  bsTgt: float = 0.0
+  bsHeld: float = 0.0
+  bsLast: float = -1000000.0
+  bsN: float = 0.0
+  bsGross: float = 0.0
+)
+
+on chart.close {
+  // Series functions first, before any branching.
+  let hh = ta.highest(chart.high, swingLen == 0 ? 1 : swingLen)
+  let ll = ta.lowest(chart.low, swingLen == 0 ? 1 : swingLen)
+
+  let t = chart.time ?? time.fromUnixSeconds(0)
+  let hi = chart.high ?? 0.0
+  let lo = chart.low ?? 0.0
+  let px = chart.close ?? 0.0
+  let d = vd.close ?? 0.0
+  let gap: float? = null
+  let tfMin = math.round(time.tfSeconds(context.timeframe)) / 60.0
+  let maxBars = maxHrs * 60.0 / tfMin
+  let everyBars = benchHrs * 60.0 / tfMin
+  barNo = barNo + 1.0
+  firstPx = firstPx > 0.0 ? firstPx : px
+  let wasFlat = dir == 0.0
+
+  // 1. Bubble detection (threshold from the average BEFORE this bar).
+  let warm = barNo > math.round(bubLen)
+  let thr = bubMult * emaAbs
+  let atHigh = swingLen == 0 || hi >= (hh ?? hi)
+  let atLow = swingLen == 0 || lo <= (ll ?? lo)
+  let buyBub = warm && emaAbs > 0.0 && d > thr && atHigh
+  let sellBub = warm && emaAbs > 0.0 && -d > thr && atLow
+  let alpha = 2.0 / (math.round(bubLen) + 1.0)
+  emaAbs = emaAbs + alpha * (math.abs(d) - emaAbs)
+  buyBubs = buyBub ? buyBubs + 1.0 : buyBubs
+  sellBubs = sellBub ? sellBubs + 1.0 : sellBubs
+
+  // 2. Confirmation of a pending fade from the previous bar.
+  let confShort = wasFlat && pDir < -0.5 && hi <= pHi
+  let confLong = wasFlat && pDir > 0.5 && lo >= pLo
+  let voidNow = wasFlat && pDir != 0.0 && !confShort && !confLong
+  voided = voidNow ? voided + 1.0 : voided
+
+  // 3. Entry decision for this bar.
+  //    Fade: buy bubble -> short, sell bubble -> long. Follow: the opposite.
+  let fadeNow = mode == 0 && confirm == 0
+  let wantShort = confShort || (wasFlat && ((fadeNow && buyBub) || (mode == 1 && sellBub)))
+  let wantLong = confLong || (wasFlat && ((fadeNow && sellBub) || (mode == 1 && buyBub)))
+  // stop reference: fade = bubble extreme; follow = bubble's opposite end
+  let refShort = confShort ? pHi : hi
+  let refLong = confLong ? pLo : lo
+  pDir = 0.0
+  if wantShort || wantLong {
+    let dd = wantLong ? 1.0 : -1.0
+    let stopLevel = wantLong ? refLong * (1.0 - bufferBps / 10000.0) : refShort * (1.0 + bufferBps / 10000.0)
+    let slDist = math.max(math.abs(px - stopLevel), px * minSlBps / 10000.0)
+    let slBps = slDist / px * 10000.0
+    if slBps > maxSlBps {
+      skipped = skipped + 1.0
+    } else {
+      dir = dd
+      entry = px
+      stopPx = px - dd * slDist
+      tgtPx = px + dd * tpR * slDist
+      held = 0.0
+      entryT = t
+      tradeSlBps = slBps
+      entries = entries + 1.0
+      slSum = slSum + slBps
+    }
+  }
+  let enteredNow = wasFlat && dir != 0.0
+
+  // New pending fade (needs the next bar to confirm).
+  if dir == 0.0 && mode == 0 && confirm == 1 && (buyBub || sellBub) {
+    pDir = buyBub ? -1.0 : 1.0
+    pHi = hi
+    pLo = lo
+  }
+
+  // 4. Manage the open trade from the bar after entry; stop before target.
+  if dir != 0.0 && !enteredNow {
+    held = held + 1.0
+    let hitStop = dir > 0.0 ? lo <= stopPx : hi >= stopPx
+    let hitTgt = !hitStop && (dir > 0.0 ? hi >= tgtPx : lo <= tgtPx)
+    if hitStop || hitTgt || held >= maxBars {
+      let exitPx = hitStop ? stopPx : (hitTgt ? tgtPx : px)
+      let gross = (exitPx - entry) / entry * 10000.0 * dir
+      let exitFee = hitTgt ? makerBps : takerBps + slipBps
+      let pnl = gross - (takerBps + slipBps + exitFee)
+      cum = cum + pnl
+      cumGross = cumGross + gross
+      cumR = cumR + pnl / tradeSlBps
+      peakR = math.max(peakR, cumR)
+      maxDdR = math.max(maxDdR, peakR - cumR)
+      trades = trades + 1.0
+      wins = pnl > 0.0 ? wins + 1.0 : wins
+      stops = hitStop ? stops + 1.0 : stops
+      targets = hitTgt ? targets + 1.0 : targets
+      timeouts = (!hitStop && !hitTgt) ? timeouts + 1.0 : timeouts
+      longs = dir > 0.0 ? longs + 1.0 : longs
+      longGross = dir > 0.0 ? longGross + gross : longGross
+      shorts = dir < 0.0 ? shorts + 1.0 : shorts
+      shortGross = dir < 0.0 ? shortGross + gross : shortGross
+      aSlot = aSlot >= 999 ? 0 : aSlot + 1
+      arrows.get("trade", aSlot).set(
+        x1: entryT,
+        y1: entry,
+        x2: t,
+        y2: exitPx,
+        color: pnl > 0.0 ? color.green : color.red,
+        width: 2,
+      )
+      dir = 0.0
+    }
+  }
+
+  // Snapshot running totals every 100 bars for the automatic halves.
+  blk = blk + 1
+  if blk >= 100 {
+    blk = 0
+    snapN.push(trades)
+    snapG.push(cumGross)
+    snapE.push(cum)
+    if flip == 1 {
+      midIdx = midIdx + 1
+    }
+    flip = 1 - flip
+  }
+
+  // 5. Benchmark books: no signal, same stop size, target multiple and hold.
+  let benchSl = benchSlBps > 0.0 ? benchSlBps : (entries > 0.0 ? slSum / entries : minSlBps)
+  if blOpen > 0.5 {
+    blHeld = blHeld + 1.0
+    let blHitStop = lo <= blStop
+    let blHitTgt = hi >= blTgt
+    if blHitStop || blHitTgt || blHeld >= maxBars {
+      let blExit = blHitStop ? blStop : (blHitTgt ? blTgt : px)
+      blGross = blGross + (blExit - blEntry) / blEntry * 10000.0
+      blN = blN + 1.0
+      blOpen = 0.0
+    }
+  }
+  if blOpen < 0.5 && barNo - blLast >= everyBars && px > 0.0 {
+    blOpen = 1.0
+    blEntry = px
+    blStop = px * (1.0 - benchSl / 10000.0)
+    blTgt = px * (1.0 + tpR * benchSl / 10000.0)
+    blHeld = 0.0
+    blLast = barNo
+  }
+  if bsOpen > 0.5 {
+    bsHeld = bsHeld + 1.0
+    let bsHitStop = hi >= bsStop
+    let bsHitTgt = lo <= bsTgt
+    if bsHitStop || bsHitTgt || bsHeld >= maxBars {
+      let bsExit = bsHitStop ? bsStop : (bsHitTgt ? bsTgt : px)
+      bsGross = bsGross + (bsEntry - bsExit) / bsEntry * 10000.0
+      bsN = bsN + 1.0
+      bsOpen = 0.0
+    }
+  }
+  if bsOpen < 0.5 && barNo - bsLast >= everyBars && px > 0.0 {
+    bsOpen = 1.0
+    bsEntry = px
+    bsStop = px * (1.0 + benchSl / 10000.0)
+    bsTgt = px * (1.0 - tpR * benchSl / 10000.0)
+    bsHeld = 0.0
+    bsLast = barNo
+  }
+
+  longIn.plot(enteredNow && dir > 0.0 ? entry : gap)
+  shortIn.plot(enteredNow && dir < 0.0 ? entry : gap)
+  buyBubM.plot(buyBub ? hi : gap)
+  sellBubM.plot(sellBub ? lo : gap)
+  equity.plot(cum)
+  grossEq.plot(cumGross)
+
+  // 6. Results table.
+  let tgtRate = trades > 0.0 ? targets / trades * 100.0 : 0.0
+  let stopRate = trades > 0.0 ? stops / trades * 100.0 : 0.0
+  let toRate = trades > 0.0 ? timeouts / trades * 100.0 : 0.0
+  let winRate = trades > 0.0 ? wins / trades * 100.0 : 0.0
+  let avgNet = trades > 0.0 ? cum / trades : 0.0
+  let avgGross = trades > 0.0 ? cumGross / trades : 0.0
+  let avgLong = longs > 0.0 ? longGross / longs : 0.0
+  let avgShort = shorts > 0.0 ? shortGross / shorts : 0.0
+  let days = barNo * tfMin / 1440.0
+  let h1n = snapN[midIdx] ?? 0.0
+  let h1Gross = snapG[midIdx] ?? 0.0
+  let h1Net = snapE[midIdx] ?? 0.0
+  let h2n = trades - h1n
+  let h1g = h1n > 0.0 ? h1Gross / h1n : 0.0
+  let h1e = h1n > 0.0 ? h1Net / h1n : 0.0
+  let h2g = h2n > 0.0 ? (cumGross - h1Gross) / h2n : 0.0
+  let h2e = h2n > 0.0 ? (cum - h1Net) / h2n : 0.0
+  let avgStop = entries > 0.0 ? slSum / entries : 0.0
+  let mkt = firstPx > 0.0 ? (px / firstPx - 1.0) * 10000.0 : 0.0
+  let bLong = blN > 0.0 ? blGross / blN : 0.0
+  let bShort = bsN > 0.0 ? bsGross / bsN : 0.0
+  let edgeLong = avgLong - bLong
+  let edgeShort = avgShort - bShort
+  let txtEdgeL = longs > 0.0 ? str.format("{0:+.1}", edgeLong) : "n/a (no longs)"
+  let txtEdgeS = shorts > 0.0 ? str.format("{0:+.1}", edgeShort) : "n/a (no shorts)"
+  let colEdgeL = longs > 0.0 ? (edgeLong >= 0.0 ? color.green : color.red) : color.gray
+  let colEdgeS = shorts > 0.0 ? (edgeShort >= 0.0 ? color.green : color.red) : color.gray
+  let txtNet = trades > 0.0 ? str.format("{0:+.1}", avgNet) : "n/a (no trades)"
+  let colNet = trades > 0.0 ? (avgNet >= 0.0 ? color.green : color.red) : color.gray
+  let perDay = days > 0.0 ? trades / days : 0.0
+  let avgR = trades > 0.0 ? cumR / trades : 0.0
+  let riskUsd = acctUsd * riskPct / 100.0
+  let notional = avgStop > 0.0 ? riskUsd / (avgStop / 10000.0) : 0.0
+  let avgCost = trades > 0.0 ? (cumGross - cum) / trades : 0.0
+  let modeTxt = mode == 1 ? "follow bubble" : (confirm == 1 ? "fade, confirmed" : "fade, immediate")
+
+  results.tbl.row("01", "Bubbles: buy at high / sell at low", str.format("{0:.0} / {1:.0}", buyBubs, sellBubs))
+  results.tbl.row("02", "Voided (extended) / skipped (stop too wide)", str.format("{0:.0} / {1:.0}", voided, skipped))
+  results.tbl.row("03", "Trades", str.format("{0:.0}", trades))
+  results.tbl.row("04", "Target / stop / timeout", str.format("{0:.0}% / {1:.0}% / {2:.0}%", tgtRate, stopRate, toRate))
+  results.tbl.row("05", "Net-positive trades", str.format("{0:.1}%", winRate))
+  results.tbl.row("06", "Avg gross / trade (bps)", str.format("{0:+.1}", avgGross))
+  results.tbl.row("07", "Avg net / trade (bps)", table.cell(txtNet, fg: colNet))
+  results.tbl.row("08", "Longs / shorts: n / avg gross", str.format("{0:.0} / {1:+.1}  |  {2:.0} / {3:+.1}", longs, avgLong, shorts, avgShort))
+  results.tbl.row("09", "Bars / days loaded", str.format("{0:.0} / {1:.1}", barNo, days))
+  results.tbl.row("10", "1st half (auto): n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", h1n, h1g, h1e))
+  results.tbl.row("11", "2nd half (auto): n / gross / net", str.format("{0:.0} / {1:+.1} / {2:+.1}", h2n, h2g, h2e))
+  results.tbl.row("12", "Market move over window (bps)", str.format("{0:+.0}", mkt))
+  results.tbl.row("13", "Strategy avg stop / bench stop (bps)", str.format("{0:.1} / {1:.1}", avgStop, benchSl))
+  results.tbl.row("14", "Bench longs / shorts: avg gross", str.format("{0:+.1} (n {1:.0})  |  {2:+.1} (n {3:.0})", bLong, blN, bShort, bsN))
+  results.tbl.row("15", "Longs vs bench (bps/trade)", table.cell(txtEdgeL, fg: colEdgeL))
+  results.tbl.row("16", "Shorts vs bench (bps/trade)", table.cell(txtEdgeS, fg: colEdgeS))
+  results.tbl.row("17", "Trades per day / per week", str.format("{0:.2} / {1:.1}", perDay, perDay * 7.0))
+  results.tbl.row("18", "Avg net in R / total R / max DD R", str.format("{0:+.2} / {1:+.1} / {2:.1}", avgR, cumR, maxDdR))
+  results.tbl.row("19", "Risk $ per trade / avg position size $", str.format("{0:.0} / {1:.0}", riskUsd, notional))
+  results.tbl.row("20", "Avg $ / total $ / max drawdown $", str.format("{0:+.0} / {1:+.0} / {2:.0}", avgR * riskUsd, cumR * riskUsd, maxDdR * riskUsd))
+  results.tbl.row("21", "Avg cost / trade (bps)", str.format("{0:.1}", avgCost))
+  results.tbl.row("22", "Mode", modeTxt)
+  results.tbl.row("23", "Position now", dir > 0.0 ? "long" : (dir < 0.0 ? "short" : "flat"))
+}
