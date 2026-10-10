@@ -8,6 +8,6 @@ pipeline/
 .git/
 *.ipynb
 _bq_backfill_ticker.py
-tft_main/
-research/
+trading_brains_main_tft/
+side_experiments_and_research/
 docs/

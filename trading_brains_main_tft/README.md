@@ -1,4 +1,4 @@
-# tft_main/ — the main Trading Brains TFT model (Dominik)
+# trading_brains_main_tft/ — the main Trading Brains TFT model (Dominik)
 
 | File | Purpose |
 |---|---|

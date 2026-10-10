@@ -1,4 +1,4 @@
-# research/ — strategy research (Matthias & Claude)
+# side_experiments_and_research/ — strategy research (Matthias & Claude)
 
 Current status and all findings: [`../docs/PROJECT_STATUS.md`](../docs/PROJECT_STATUS.md).
 
