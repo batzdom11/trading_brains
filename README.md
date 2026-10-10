@@ -8,13 +8,13 @@
 | `pipeline/`, `build_and_submit.py` | Vertex AI training container and job submission | Dominik |
 | `trading/` | Paper-trading service (Alpaca) and its architecture doc | Dominik |
 | `cloud_functions/` | Scheduled cloud functions | Dominik |
-| `model/` | TFT model development: notebooks, local checkpoints, training logs, SPY data | Dominik |
-| `research/` | Strategy research and backtests (BTC/MMT order flow, SPY vs BTC control, MMT scripts) | Matthias & Claude |
+| `tft_main/` | The main Trading Brains TFT model: development notebooks, local checkpoints (`models/`, `checkpoints/`), training logs, SPY data | Dominik |
+| `research/` | Side experiments, separate from the main model: BTC/MMT order flow, SPY vs BTC control, MMT backtest scripts | Matthias & Claude |
 | `docs/` | Shared project status and the ML-for-trading literature review | all |
 
 Deployment paths are unchanged: everything Cloud Run, Vertex AI and the cloud
-functions build from still sits where it was. Notebooks in `model/` expect to be
-run with `model/` as the working directory (the default in VS Code / Jupyter),
+functions build from still sits where it was. Notebooks in `tft_main/` expect to be
+run with `tft_main/` as the working directory (the default in VS Code / Jupyter),
 so their relative paths `models/…` and `checkpoints/…` keep working.
 
 ---
