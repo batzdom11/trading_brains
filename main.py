@@ -79,6 +79,17 @@ TICKER_BIAS_CORRECTION = {
     'BTC': 0.0031,  # model overshoots downside by ~0.31%
 }
 
+# Prediction horizons: label -> index into the model's 60-step output (step N = index N-1)
+PREDICTION_HORIZONS = {
+    '1m': 0,
+    '5m': 4,
+    '10m': 9,
+    '15m': 14,
+    '30m': 29,
+    '45m': 44,
+    '60m': 59,
+}
+
 # Per-ticker model cache: {ticker: (model, dataset_params, device)}
 _model_cache = {}
 
@@ -91,14 +102,9 @@ def _ensure_predictions_schema():
         table = client.get_table(table_id)
         existing_fields = {f.name for f in table.schema}
         new_fields = [
-            ("q10_15m", "FLOAT64"), ("q90_15m", "FLOAT64"),
-            ("q10_30m", "FLOAT64"), ("q90_30m", "FLOAT64"),
-            ("q10_45m", "FLOAT64"), ("q90_45m", "FLOAT64"),
-            ("q10_60m", "FLOAT64"), ("q90_60m", "FLOAT64"),
-            ("confidence_15m", "FLOAT64"), ("confidence_30m", "FLOAT64"),
-            ("confidence_45m", "FLOAT64"), ("confidence_60m", "FLOAT64"),
-            ("uncertainty_15m", "FLOAT64"), ("uncertainty_30m", "FLOAT64"),
-            ("uncertainty_45m", "FLOAT64"), ("uncertainty_60m", "FLOAT64"),
+            (f"{prefix}_{label}", "FLOAT64")
+            for label in PREDICTION_HORIZONS
+            for prefix in ("pred", "return", "q10", "q90", "confidence", "uncertainty")
         ]
         to_add = [(n, t) for n, t in new_fields if n not in existing_fields]
         if to_add:
@@ -550,7 +556,7 @@ def get_predictions(ticker='SPY'):
     # q_array shape: (60, 7) — 60 timesteps × 7 quantiles
     # Indices: 0=q02, 1=q10, 2=q25, 3=q50, 4=q75, 5=q90, 6=q98
     
-    # 5. Extract predictions at 15, 30, 45, 60 minutes
+    # 5. Extract predictions at the horizons in PREDICTION_HORIZONS
     # Last encoder position = end of lookback window (before prediction horizon)
     last_close = df_recent['close'].iloc[-(max_prediction_length + 1)]
 
@@ -581,44 +587,23 @@ def get_predictions(ticker='SPY'):
         confidence = (midpoint - base_price) / interval_width
         return q10, q90, float(confidence)
 
-    q10_15m, q90_15m, conf_15m = _quantile_confidence(q_array, 14, last_close)
-    q10_30m, q90_30m, conf_30m = _quantile_confidence(q_array, 29, last_close)
-    q10_45m, q90_45m, conf_45m = _quantile_confidence(q_array, 44, last_close)
-    q10_60m, q90_60m, conf_60m = _quantile_confidence(q_array, 59, last_close)
-
     predictions = {
         'timestamp': datetime.utcnow().isoformat(),
         'ticker': ticker,
         'last_price': float(last_close),
         'last_price_time': str(last_timestamp),
-        'pred_15m': float(pred_array[14]),
-        'pred_30m': float(pred_array[29]),
-        'pred_45m': float(pred_array[44]),
-        'pred_60m': float(pred_array[59]),
-        'return_15m': float((pred_array[14] - last_close) / last_close * 100),
-        'return_30m': float((pred_array[29] - last_close) / last_close * 100),
-        'return_45m': float((pred_array[44] - last_close) / last_close * 100),
-        'return_60m': float((pred_array[59] - last_close) / last_close * 100),
-        # Quantile bounds (10th and 90th percentile)
-        'q10_15m': q10_15m,
-        'q90_15m': q90_15m,
-        'q10_30m': q10_30m,
-        'q90_30m': q90_30m,
-        'q10_45m': q10_45m,
-        'q90_45m': q90_45m,
-        'q10_60m': q10_60m,
-        'q90_60m': q90_60m,
-        # Confidence scores: positive=bullish, negative=bearish, magnitude=strength
-        'confidence_15m': conf_15m,
-        'confidence_30m': conf_30m,
-        'confidence_45m': conf_45m,
-        'confidence_60m': conf_60m,
-        # Prediction interval width as % of price (model uncertainty)
-        'uncertainty_15m': float((q90_15m - q10_15m) / last_close * 100),
-        'uncertainty_30m': float((q90_30m - q10_30m) / last_close * 100),
-        'uncertainty_45m': float((q90_45m - q10_45m) / last_close * 100),
-        'uncertainty_60m': float((q90_60m - q10_60m) / last_close * 100),
     }
+    for label, idx in PREDICTION_HORIZONS.items():
+        q10, q90, conf = _quantile_confidence(q_array, idx, last_close)
+        predictions[f'pred_{label}'] = float(pred_array[idx])
+        predictions[f'return_{label}'] = float((pred_array[idx] - last_close) / last_close * 100)
+        # Quantile bounds (10th and 90th percentile)
+        predictions[f'q10_{label}'] = q10
+        predictions[f'q90_{label}'] = q90
+        # Confidence: positive=bullish, negative=bearish, magnitude=strength
+        predictions[f'confidence_{label}'] = conf
+        # Prediction interval width as % of price (model uncertainty)
+        predictions[f'uncertainty_{label}'] = float((q90 - q10) / last_close * 100)
     
     # 6. Extract TFT attention weights and feature importance
     try:
@@ -1136,10 +1121,7 @@ def test_model():
                 'rows_after_features': len(df_pred),
                 'data_range': f"{df['timestamp'].min()} to {df['timestamp'].max()}",
                 'base_price': float(last_close),
-                'pred_15m': float(pred_array[14]),
-                'pred_30m': float(pred_array[29]),
-                'pred_45m': float(pred_array[44]),
-                'pred_60m': float(pred_array[59]),
+                **{f'pred_{label}': float(pred_array[idx]) for label, idx in PREDICTION_HORIZONS.items()},
             }
         })
         
